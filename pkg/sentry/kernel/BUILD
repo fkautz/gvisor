@@ -263,6 +263,7 @@ go_library(
         "cgroup_mutex.go",
         "cgroup_v2_mutex.go",
         "context.go",
+        "execve_sha256_cache.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
@@ -439,6 +440,7 @@ go_test(
     name = "kernel_test",
     size = "small",
     srcs = [
+        "execve_sha256_cache_test.go",
         "fd_table_test.go",
         "table_test.go",
         "task_test.go",

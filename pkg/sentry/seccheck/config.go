@@ -39,6 +39,9 @@ var sessionCounter = metric.MustCreateNewUint64Metric("/trace/sessions_created",
 		Description: "Counts the number of trace sessions created.",
 	})
 
+// SessionOptionHandler is invoked whenever a session configuration is created or deleted.
+var SessionOptionHandler func(conf *SessionConfig)
+
 // SessionConfig describes a new session configuration. A session consists of a
 // set of points to be enabled and sinks where the points are sent to.
 type SessionConfig struct {
@@ -55,6 +58,8 @@ type SessionConfig struct {
 	IgnoreMissing bool `json:"ignore_missing,omitempty"`
 	// Sinks are the sinks that will process the points enabled above.
 	Sinks []SinkConfig `json:"sinks,omitempty"`
+	// Options holds session-level configuration options.
+	Options map[string]any `json:"options,omitempty"`
 }
 
 // PointConfig describes a point to be enabled in a given session.
@@ -144,6 +149,9 @@ func Create(conf *SessionConfig, force bool) error {
 
 	sessions[conf.Name] = state
 	sessionCounter.Increment()
+	if SessionOptionHandler != nil {
+		SessionOptionHandler(conf)
+	}
 	return nil
 }
 
@@ -194,6 +202,11 @@ func deleteLocked(name string) error {
 
 	session.clearSink()
 	delete(sessions, name)
+	// Invoke SessionOptionHandler with an options-empty SessionConfig so dependent packages
+	// (e.g. kernel cache sizing) can cleanly reset session-scoped options to defaults upon teardown.
+	if SessionOptionHandler != nil {
+		SessionOptionHandler(&SessionConfig{Name: name})
+	}
 	return nil
 }
 
