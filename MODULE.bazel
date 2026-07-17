@@ -197,6 +197,7 @@ use_repo(
     "com_github_mdlayher_vsock",
     "com_github_moby_docker_image_spec",
     "com_github_moby_sys_capability",
+    "com_github_moby_sys_mountinfo",
     "com_github_moby_sys_sequential",
     "com_github_moby_sys_signal",
     "com_github_moby_sys_symlink",
