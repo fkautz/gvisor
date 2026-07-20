@@ -31,6 +31,8 @@ type BundleConfig struct {
 	Mounts           []Mount
 	Env              []string
 	Annotations      map[string]string
+	Command          []string
+	WorkingDir       string
 }
 
 // NewBundle creates a temporary OCI bundle on the fly with the given configuration.
@@ -68,9 +70,8 @@ func NewBundle(cfg BundleConfig) (string, error) {
 		Process: &specs.Process{
 			Terminal: false,
 			User:     specs.User{UID: 0, GID: 0},
-			// Keeps the sandbox alive on the background.
-			Args: []string{"sleep", "infinity"},
-			Cwd:  "/",
+			Args:     cfg.Command,
+			Cwd:      cfg.WorkingDir,
 		},
 		Mounts: []specs.Mount{
 			// Mandatory Linux API Filesystems

@@ -228,7 +228,48 @@ func TestNewBundleEnv(t *testing.T) {
 		"TEST_VAR=B",
 	}
 
+	// Verify default env vars
 	if !slices.Equal(spec.Process.Env, expectedEnv) {
 		t.Errorf("spec.Process.Env = %+v, want %+v", spec.Process.Env, expectedEnv)
+	}
+}
+
+func TestNewBundleCommandAndWorkingDir(t *testing.T) {
+	tempDir := t.TempDir()
+	sandboxID := "test-sandbox-command-cwd"
+
+	customCommand := []string{"echo", "hello world"}
+	customCwd := "/custom/absolute/path"
+
+	bundleDir, err := sandbox.NewBundle(sandbox.BundleConfig{
+		ID:         sandboxID,
+		RuntimeDir: tempDir,
+		Command:    customCommand,
+		WorkingDir: customCwd,
+	})
+
+	if err != nil {
+		t.Fatalf("NewBundle failed: %v", err)
+	}
+	defer os.RemoveAll(bundleDir)
+
+	configPath := filepath.Join(bundleDir, "config.json")
+	configFile, err := os.Open(configPath)
+	if err != nil {
+		t.Fatalf("failed to open config.json: %v", err)
+	}
+	defer configFile.Close()
+
+	var spec specs.Spec
+	if err := json.NewDecoder(configFile).Decode(&spec); err != nil {
+		t.Fatalf("failed to decode config.json: %v", err)
+	}
+
+	if !slices.Equal(spec.Process.Args, customCommand) {
+		t.Errorf("spec.Process.Args = %+v, want %+v", spec.Process.Args, customCommand)
+	}
+
+	if spec.Process.Cwd != customCwd {
+		t.Errorf("spec.Process.Cwd = %q, want %q", spec.Process.Cwd, customCwd)
 	}
 }
