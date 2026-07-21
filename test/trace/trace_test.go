@@ -416,16 +416,36 @@ func checkSentryExec(msg test.Message) error {
 	if err := checkContextData(p.ContextData); err != nil {
 		return err
 	}
-	// As test runs locally the binary path may resolve to a symlink so would not be exactly same
-	// as the pathname passed.
+
 	if want := "/bin/true"; !strings.Contains(p.BinaryPath, want) {
 		return fmt.Errorf("wrong BinaryPath, want: %q, got: %q", want, p.BinaryPath)
 	}
 	if len(p.Argv) == 0 {
 		return fmt.Errorf("empty Argv")
 	}
-	if !strings.Contains(p.BinaryPath, p.Argv[0]) {
-		return fmt.Errorf("wrong Argv[0], want: %q, got: %q", p.BinaryPath, p.Argv[0])
+
+	// workload.cc fires two distinct ForkAndExec execution workloads:
+	// 1. A test checking execve syscall resolution using a symlink.
+	//    This uses "test_binary_name" as argv[0] mapping to a symlink at "/tmp/test_symlink".
+	// 2. A test covering execveat testing, which represents "/bin/true" relative to its path.
+	if p.Argv[0] == "test_binary_name" {
+		// In this case, we expect the following distinct path values:
+		// 1. BinaryPath: The fully resolved system path mapped by Sentry
+		//    (points to /bin/true).
+		// 2. Execfn: The exact invariant path string given by caller
+		//    (points to unresolved /tmp/test_symlink).
+		// 3. Argv[0]: The arbitrary caller-provided process argument
+		//    (points to synthetic "test_binary_name").
+		if want := "/tmp/test_symlink"; p.Execfn != want {
+			return fmt.Errorf("wrong Execfn, want: %q, got: %q", want, p.Execfn)
+		}
+		if p.BinaryPath == p.Execfn {
+			return fmt.Errorf("BinaryPath (%q) should differ from Execfn (%q)", p.BinaryPath, p.Execfn)
+		}
+	} else {
+		if !strings.Contains(p.BinaryPath, p.Argv[0]) {
+			return fmt.Errorf("wrong Argv[0], want: %q, got: %q", p.BinaryPath, p.Argv[0])
+		}
 	}
 	if len(p.Env) == 0 {
 		return fmt.Errorf("empty Env")
@@ -483,20 +503,34 @@ func checkSyscallExecve(msg test.Message) error {
 	if err := checkContextData(p.ContextData); err != nil {
 		return err
 	}
-	if p.Fd < 3 {
-		return fmt.Errorf("execve invalid FD: %d", p.Fd)
-	}
-	if want := "/"; want != p.FdPath {
-		return fmt.Errorf("wrong FdPath, want: %q, got: %q", want, p.FdPath)
-	}
-	if want := "/bin/true"; want != p.Pathname {
-		return fmt.Errorf("wrong Pathname, want: %q, got: %q", want, p.Pathname)
-	}
 	if len(p.Argv) == 0 {
 		return fmt.Errorf("empty Argv")
 	}
-	if p.Argv[0] != p.Pathname {
-		return fmt.Errorf("wrong Argv[0], want: %q, got: %q", p.Pathname, p.Argv[0])
+	// We handle two separate execs from workload.cc:
+	// 1. ForkAndExec, which tests execve relative to "/tmp/test_symlink" using "test_binary_name".
+	// 2. ForkAndExecveat, which tests execveat against "/bin/true" relative to its path.
+	if p.Argv[0] == "test_binary_name" {
+		// PointExecve doesn't populate Fd, so it defaults to 0.
+		if p.Fd != 0 {
+			return fmt.Errorf("execve invalid FD: %d", p.Fd)
+		}
+		if want := "/tmp/test_symlink"; want != p.Pathname {
+			return fmt.Errorf("wrong Pathname, want: %q, got: %q", want, p.Pathname)
+		}
+	} else {
+		// PointExecveat gets a dirfd that is explicitly opened by the workload so it is >= 3.
+		if p.Fd < 3 {
+			return fmt.Errorf("execve invalid FD: %d", p.Fd)
+		}
+		if want := "/"; want != p.FdPath {
+			return fmt.Errorf("wrong FdPath, want: %q, got: %q", want, p.FdPath)
+		}
+		if want := "/bin/true"; want != p.Pathname {
+			return fmt.Errorf("wrong Pathname, want: %q, got: %q", want, p.Pathname)
+		}
+		if p.Argv[0] != p.Pathname {
+			return fmt.Errorf("wrong Argv[0], want: %q, got: %q", p.Pathname, p.Argv[0])
+		}
 	}
 	if len(p.Envv) == 0 {
 		return fmt.Errorf("empty Envv")
