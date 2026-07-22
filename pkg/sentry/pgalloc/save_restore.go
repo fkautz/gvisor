@@ -1063,7 +1063,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			f.opts.SharedBaseFile = opts.SharedBaseFile
 			f.opts.SharedBaseBytes = opts.SharedBaseBytes
 			if opts.CasimirDataFile != nil && hi > 0 {
-				if err := startCasimirFaults(opts.CasimirDataFile, opts.SharedBaseFile, mapStart, hi); err != nil {
+				if err := startCasimirFaults(opts.CasimirDataFile, mapStart, hi); err != nil {
 					return fmt.Errorf("start Casimir shared-base faults: %w", err)
 				}
 			}
