@@ -20,7 +20,7 @@ const (
 	uffdFeatureMissingShmem = 1 << 5
 	uffdioAPI               = 0xc018aa3f
 	uffdioRegister          = 0xc020aa00
-	uffdioWake              = 0x8010aa02
+	uffdioCopy              = 0xc028aa03
 	uffdioZeropage          = 0xc020aa04
 	uffdioRegisterMissing   = 1
 )
@@ -44,6 +44,11 @@ type uffdioZeropageRequest struct {
 	Zeropage int64
 }
 
+type uffdioCopyRequest struct {
+	Dst, Src, Len, Mode uint64
+	Copy                int64
+}
+
 type casimirFaultRequest struct {
 	Operation string `json:"operation"`
 	Offset    uint64 `json:"offset"`
@@ -55,38 +60,55 @@ type casimirFaultResponse struct {
 	Zero  bool   `json:"zero,omitempty"`
 }
 
-func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
+func startCasimirFaults(dataFile, baseFile *os.File, start uintptr, length uint64) error {
+	source, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
+		0,
+		uintptr(length),
+		unix.PROT_READ,
+		unix.MAP_SHARED,
+		baseFile.Fd(),
+		0)
+	if errno != 0 {
+		return errno
+	}
 	fd, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK|uffdUserModeOnly), 0, 0)
 	if errno != 0 {
+		unix.Syscall(unix.SYS_MUNMAP, source, uintptr(length), 0)
 		return errno
 	}
 	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); errno != 0 {
 		unix.Close(int(fd))
+		unix.Syscall(unix.SYS_MUNMAP, source, uintptr(length), 0)
 		return errno
 	}
 	if api.Features&uffdFeatureMissingShmem == 0 {
 		unix.Close(int(fd))
+		unix.Syscall(unix.SYS_MUNMAP, source, uintptr(length), 0)
 		return unix.ENOTSUP
 	}
 	registration := uffdioRegisterRequest{Range: uffdioRange{Start: uint64(start), Len: length}, Mode: uffdioRegisterMissing}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); errno != 0 {
 		unix.Close(int(fd))
+		unix.Syscall(unix.SYS_MUNMAP, source, uintptr(length), 0)
 		return errno
 	}
 	conn, err := net.FileConn(dataFile)
 	dataFile.Close()
 	if err != nil {
 		unix.Close(int(fd))
+		unix.Syscall(unix.SYS_MUNMAP, source, uintptr(length), 0)
 		return err
 	}
-	go serveCasimirFaults(int(fd), conn, uint64(start), length)
+	go serveCasimirFaults(int(fd), conn, uint64(start), uint64(source), length)
 	return nil
 }
 
-func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
+func serveCasimirFaults(uffd int, conn net.Conn, start, source, length uint64) {
 	defer unix.Close(uffd)
 	defer conn.Close()
+	defer unix.Syscall(unix.SYS_MUNMAP, uintptr(source), uintptr(length), 0)
 	// Any loss or rejection of the verifier channel leaves a missing page
 	// unresolved. Terminate the Sentry instead of permitting zero-fill or a
 	// private fallback.
@@ -142,9 +164,9 @@ func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
 			}
 			continue
 		}
-		wake := uffdioRange{Start: pageStart, Len: pageSize}
-		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioWake, uintptr(unsafe.Pointer(&wake))); errno != 0 {
-			log.Warningf("Casimir verified-page wake failed: %v", errno)
+		copy := uffdioCopyRequest{Dst: pageStart, Src: source + (pageStart - start), Len: pageSize}
+		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioCopy, uintptr(unsafe.Pointer(&copy))); errno != 0 {
+			log.Warningf("Casimir verified-page installation failed: %v", errno)
 			return
 		}
 	}
