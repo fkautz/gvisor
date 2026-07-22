@@ -324,6 +324,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 			// Convert a BusError error to a SIGBUS from a SIGSEGV. All
 			// other info bits stay the same (address, etc.).
 			if _, ok := err.(*memmap.BusError); ok {
+				t.Warningf("Casimir guest mapping SIGBUS: addr=%#x ip=%#x access=%v signalCode=%d err=%T: %v", addr, t.Arch().IP(), at, info.Code, err, err)
 				sig = linux.SIGBUS
 				info.Signo = int32(linux.SIGBUS)
 			}
