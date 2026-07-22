@@ -108,9 +108,6 @@ type SaveOpts struct {
 	// they are served by the shared base mapping rather than reloaded.
 	SharedBaseFile  *os.File
 	SharedBaseBytes uint64
-	// CasimirDataFile is an inherited authenticated stream used to resolve
-	// missing shared-base pages through the node-owned page provider.
-	CasimirDataFile *os.File
 }
 
 // SaveTo writes f's state to the given stream.
@@ -975,6 +972,9 @@ type LoadOpts struct {
 	// this prototype (see finding F8: the async loader writes to the memfd FD).
 	SharedBaseFile  *os.File
 	SharedBaseBytes uint64
+	// CasimirDataFile is an inherited authenticated stream used to resolve
+	// missing shared-base pages through the node-owned page provider.
+	CasimirDataFile *os.File
 }
 
 // LoadFrom loads MemoryFile state from the given stream.
