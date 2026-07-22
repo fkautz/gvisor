@@ -809,10 +809,14 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 
 	// Don't return the error returned by c.cache.Fill if it occurred outside
 	// of required.
+	if cerr != nil || translatedEnd < required.End {
+		log.Warningf("Casimir gofer translation required=%v optional=%v size=%d translatedEnd=%d fillErr=%v", required, optional, d.inode.size.Load(), translatedEnd, cerr)
+	}
 	if translatedEnd < required.End && cerr != nil {
 		return ts, &memmap.BusError{cerr}
 	}
 	if beyondEOF {
+		log.Warningf("Casimir gofer translation crossed EOF required=%v optional=%v size=%d", required, optional, d.inode.size.Load())
 		return ts, &memmap.BusError{io.EOF}
 	}
 	return ts, nil
