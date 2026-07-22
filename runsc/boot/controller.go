@@ -564,9 +564,11 @@ type RestoreOpts struct {
 
 	// HaveBaseFile indicates a shared base memory image is present at
 	// BaseFileIndex in FilePayload (GVISOR-3 C1); BaseFileBytes is its size.
-	HaveBaseFile  bool
-	BaseFileIndex int
-	BaseFileBytes uint64
+	HaveBaseFile         bool
+	BaseFileIndex        int
+	BaseFileBytes        uint64
+	HaveCasimirDataFile  bool
+	CasimirDataFileIndex int
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
@@ -645,10 +647,18 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 		}
 		baseFile = os.NewFile(uintptr(bfd.Release()), "base-image")
 	}
+	var casimirDataFile *os.File
+	if o.HaveCasimirDataFile {
+		cfd, err := o.ReleaseFD(o.CasimirDataFileIndex)
+		if err != nil {
+			return fmt.Errorf("releasing Casimir data FD: %w", err)
+		}
+		casimirDataFile = os.NewFile(uintptr(cfd.Release()), "casimir-data")
+	}
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, baseFile, o.BaseFileBytes, timer.Fork("PagesFileLoader")) // transfers ownership
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, baseFile, o.BaseFileBytes, casimirDataFile, timer.Fork("PagesFileLoader")) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")

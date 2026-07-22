@@ -17,10 +17,13 @@
 package fsgofer
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -61,6 +64,11 @@ type Config struct {
 	// be donated to the client on Mount RPC.
 	DonateMountPointFD bool
 
+	// CasimirDataConn is an authenticated connection inherited by the gofer.
+	// When present, regular-file bytes are read through Casimir's fs-plane
+	// instead of being donated or read from the materialized metadata tree.
+	CasimirDataConn net.Conn
+
 	// Gofer process's RUID.
 	RUID int
 
@@ -72,6 +80,54 @@ type Config struct {
 
 	// Gofer process's EGID.
 	EGID int
+}
+
+type casimirReadRequest struct {
+	Operation string `json:"operation"`
+	Path      string `json:"path"`
+	Offset    uint64 `json:"offset"`
+	Length    uint64 `json:"length"`
+}
+
+type casimirReadResponse struct {
+	Data  []byte `json:"data,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+type casimirDataClient struct {
+	mu   sync.Mutex
+	conn net.Conn
+	rw   *bufio.ReadWriter
+}
+
+func newCasimirDataClient(conn net.Conn) *casimirDataClient {
+	if conn == nil {
+		return nil
+	}
+	return &casimirDataClient{conn: conn, rw: bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))}
+}
+
+func (c *casimirDataClient) read(path string, dst []byte, off uint64) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := json.NewEncoder(c.rw).Encode(casimirReadRequest{Operation: "read", Path: path, Offset: off, Length: uint64(len(dst))}); err != nil {
+		return 0, err
+	}
+	if err := c.rw.Flush(); err != nil {
+		return 0, err
+	}
+	var response casimirReadResponse
+	if err := json.NewDecoder(c.rw).Decode(&response); err != nil {
+		return 0, err
+	}
+	if response.Error != "" {
+		return 0, fmt.Errorf("casimir fs-plane read: %s", response.Error)
+	}
+	if len(response.Data) > len(dst) {
+		return 0, fmt.Errorf("casimir fs-plane oversized response: %d > %d", len(response.Data), len(dst))
+	}
+	copy(dst, response.Data)
+	return uint64(len(response.Data)), nil
 }
 
 var procSelfFD *rwfd.FD
@@ -100,13 +156,14 @@ func ConnectionOpts(readonly bool) lisafs.ConnectionOpts {
 
 // NewConnectionImpl returns a new lisafs.ConnectionImpl for fsgofer.
 func NewConnectionImpl(config *Config) lisafs.ConnectionImpl {
-	return &connectionImpl{config: config}
+	return &connectionImpl{config: config, casimir: newCasimirDataClient(config.CasimirDataConn)}
 }
 
 // connectionImpl implements lisafs.ConnectionImpl for fsgofer.
 type connectionImpl struct {
 	// config is the global configuration for the gofer.
-	config *Config
+	config  *Config
+	casimir *casimirDataClient
 }
 
 var _ lisafs.ConnectionImpl = (*connectionImpl)(nil)
@@ -537,7 +594,7 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 
 	hostFDToDonate := -1
 	switch {
-	case ftype == unix.S_IFREG:
+	case ftype == unix.S_IFREG && impl.casimir == nil:
 		// Best effort to donate file to the Sentry (for performance only).
 		hostFDToDonate, _ = unix.Dup(openHostFD)
 
@@ -1107,14 +1164,19 @@ type openFDLisa struct {
 	lisafs.OpenFD
 
 	// hostFD is the host file descriptor which can be used to make syscalls.
-	hostFD int
+	hostFD      int
+	casimir     *casimirDataClient
+	casimirPath string
 }
 
 var _ lisafs.OpenFDImpl = (*openFDLisa)(nil)
 
 func (fd *controlFDLisa) newOpenFDLisa(hostFD int, flags uint32) *openFDLisa {
+	impl := fd.Conn().Impl().(*connectionImpl)
 	newFD := &openFDLisa{
-		hostFD: hostFD,
+		hostFD:      hostFD,
+		casimir:     impl.casimir,
+		casimirPath: fd.Node().FilePath(),
 	}
 	newFD.OpenFD.Init(fd.FD(), flags, newFD)
 	return newFD
@@ -1155,6 +1217,9 @@ func (fd *openFDLisa) Write(buf []byte, off uint64) (uint64, error) {
 
 // Read implements lisafs.OpenFDImpl.Read.
 func (fd *openFDLisa) Read(buf []byte, off uint64) (uint64, error) {
+	if fd.casimir != nil {
+		return fd.casimir.read(fd.casimirPath, buf, off)
+	}
 	rw := rwfd.NewReadWriter(fd.hostFD)
 	n, err := rw.ReadAt(buf, int64(off))
 	if err != nil && err != io.EOF {

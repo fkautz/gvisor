@@ -108,6 +108,9 @@ type SaveOpts struct {
 	// they are served by the shared base mapping rather than reloaded.
 	SharedBaseFile  *os.File
 	SharedBaseBytes uint64
+	// CasimirDataFile is an inherited authenticated stream used to resolve
+	// missing shared-base pages through the node-owned page provider.
+	CasimirDataFile *os.File
 }
 
 // SaveTo writes f's state to the given stream.
@@ -1059,6 +1062,11 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			// base range as overlay-backed (MADV_DONTNEED), not f.file-backed.
 			f.opts.SharedBaseFile = opts.SharedBaseFile
 			f.opts.SharedBaseBytes = opts.SharedBaseBytes
+			if opts.CasimirDataFile != nil && hi > 0 {
+				if err := startCasimirFaults(opts.CasimirDataFile, mapStart, hi); err != nil {
+					return fmt.Errorf("start Casimir shared-base faults: %w", err)
+				}
+			}
 		}
 		madviseWG.Add(1)
 		go func() {

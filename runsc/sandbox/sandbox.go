@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -653,6 +654,20 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 		log.Infof("Restoring main MemoryFile over shared base image %q (%d bytes)", baseFileName, fi.Size())
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("opening base image %q failed: %w", baseFileName, err)
+	}
+	if socketPath := os.Getenv("CASIMIR_DATA_SOCKET"); socketPath != "" {
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			return fmt.Errorf("connect Casimir page provider: %w", err)
+		}
+		file, err := conn.(*net.UnixConn).File()
+		conn.Close()
+		if err != nil {
+			return fmt.Errorf("inherit Casimir page provider connection: %w", err)
+		}
+		opt.FilePayload.Files = append(opt.FilePayload.Files, file)
+		opt.HaveCasimirDataFile = true
+		opt.CasimirDataFileIndex = len(opt.FilePayload.Files) - 1
 	}
 	return nil
 }
