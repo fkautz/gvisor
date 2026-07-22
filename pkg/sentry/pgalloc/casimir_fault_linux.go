@@ -96,10 +96,16 @@ func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
 	pageSize := uint64(os.Getpagesize())
 	for {
 		if _, err := unix.Poll([]unix.PollFd{{Fd: int32(uffd), Events: unix.POLLIN}}, -1); err != nil {
+			if err == unix.EINTR {
+				continue
+			}
 			log.Warningf("Casimir userfaultfd poll failed: %v", err)
 			return
 		}
 		n, err := unix.Read(uffd, msg[:])
+		if err == unix.EINTR {
+			continue
+		}
 		if err != nil || n != len(msg) {
 			log.Warningf("Casimir userfaultfd read failed: n=%d err=%v", n, err)
 			return
