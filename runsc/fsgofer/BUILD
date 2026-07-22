@@ -26,7 +26,14 @@ go_library(
 )
 
 go_test(
-    name = "lisafs_test",
+	name = "casimir_path_test",
+	size = "small",
+	srcs = ["casimir_path_test.go"],
+	embed = [":fsgofer"],
+)
+
+go_test(
+	name = "lisafs_test",
     size = "small",
     srcs = ["lisafs_test.go"],
     deps = [

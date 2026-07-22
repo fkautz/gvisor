@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -164,6 +165,9 @@ type connectionImpl struct {
 	// config is the global configuration for the gofer.
 	config  *Config
 	casimir *casimirDataClient
+	// casimirRoot is the host-side mount root stripped from every logical
+	// fs-plane request path.
+	casimirRoot string
 }
 
 var _ lisafs.ConnectionImpl = (*connectionImpl)(nil)
@@ -171,6 +175,9 @@ var _ lisafs.ConnectionImpl = (*connectionImpl)(nil)
 // Mount implements lisafs.ConnectionImpl.Mount.
 func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*lisafs.ControlFD, lisafs.Statx, int, error) {
 	mountPath := mountNode.FilePath()
+	if i.casimir != nil {
+		i.casimirRoot = mountPath
+	}
 	rootHostFD, err := tryOpen(func(flags int) (int, error) {
 		return unix.Open(mountPath, flags, 0)
 	})
@@ -1173,13 +1180,28 @@ var _ lisafs.OpenFDImpl = (*openFDLisa)(nil)
 
 func (fd *controlFDLisa) newOpenFDLisa(hostFD int, flags uint32) *openFDLisa {
 	impl := fd.Conn().Impl().(*connectionImpl)
+	casimirPath := fd.Node().FilePath()
+	if logical, ok := logicalCasimirPath(impl.casimirRoot, casimirPath); ok {
+		casimirPath = logical
+	}
 	newFD := &openFDLisa{
 		hostFD:      hostFD,
 		casimir:     impl.casimir,
-		casimirPath: fd.Node().FilePath(),
+		casimirPath: casimirPath,
 	}
 	newFD.OpenFD.Init(fd.FD(), flags, newFD)
 	return newFD
+}
+
+func logicalCasimirPath(root, hostPath string) (string, bool) {
+	if root == "" {
+		return "", false
+	}
+	relative, err := filepath.Rel(root, hostPath)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(relative), true
 }
 
 // FD implements lisafs.OpenFDImpl.FD.
