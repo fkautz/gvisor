@@ -339,6 +339,20 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	egid := unix.Getegid()
 	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d", ruid, euid, rgid, egid)
 
+	// net.FileConn duplicates the inherited descriptor with fcntl. Do this
+	// before installing the gofer seccomp policy; the long-lived client uses
+	// only ordinary socket reads and writes after publication.
+	var casimirDataConn net.Conn
+	if g.casimirDataFD >= 0 {
+		file := os.NewFile(uintptr(g.casimirDataFD), "casimir-fs-plane")
+		conn, err := net.FileConn(file)
+		file.Close()
+		if err != nil {
+			util.Fatalf("opening inherited Casimir fs-plane connection: %v", err)
+		}
+		casimirDataConn = conn
+	}
+
 	// Initialize filters.
 	opts := filter.Options{
 		UDSOpenEnabled:   conf.GetHostUDS().AllowOpen(),
@@ -355,10 +369,10 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root, ruid, euid, rgid, egid)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid, casimirDataConn)
 }
 
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, casimirDataConn net.Conn) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock      *unet.Socket
 		mountPath string
@@ -432,15 +446,7 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		RGID:               rgid,
 		EGID:               egid,
 	}
-	if g.casimirDataFD >= 0 {
-		file := os.NewFile(uintptr(g.casimirDataFD), "casimir-fs-plane")
-		conn, err := net.FileConn(file)
-		file.Close()
-		if err != nil {
-			util.Fatalf("opening inherited Casimir fs-plane connection: %v", err)
-		}
-		fsgoferConf.CasimirDataConn = conn
-	}
+	fsgoferConf.CasimirDataConn = casimirDataConn
 
 	// Create the server and start connections.
 	server := lisafs.NewServer()
