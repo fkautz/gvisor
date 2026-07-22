@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
 )
 
 const (
@@ -95,40 +96,49 @@ func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
 	pageSize := uint64(os.Getpagesize())
 	for {
 		if _, err := unix.Poll([]unix.PollFd{{Fd: int32(uffd), Events: unix.POLLIN}}, -1); err != nil {
+			log.Warningf("Casimir userfaultfd poll failed: %v", err)
 			return
 		}
 		n, err := unix.Read(uffd, msg[:])
 		if err != nil || n != len(msg) {
+			log.Warningf("Casimir userfaultfd read failed: n=%d err=%v", n, err)
 			return
 		}
 		if msg[0] != uffdEventPagefault {
+			log.Warningf("Casimir userfaultfd unexpected event: %#x", msg[0])
 			return
 		}
 		address := *(*uint64)(unsafe.Pointer(&msg[16]))
 		if address < start || address >= start+length {
+			log.Warningf("Casimir userfaultfd address outside base: %#x", address)
 			return
 		}
 		offset := address - start
 		if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", Offset: offset, Length: pageSize}); err != nil {
+			log.Warningf("Casimir fault request failed: %v", err)
 			return
 		}
 		if err := rw.Flush(); err != nil {
+			log.Warningf("Casimir fault request flush failed: %v", err)
 			return
 		}
 		var response casimirFaultResponse
 		if err := json.NewDecoder(rw).Decode(&response); err != nil || response.Error != "" {
+			log.Warningf("Casimir fault rejected: response=%q err=%v", response.Error, err)
 			return
 		}
 		pageStart := address &^ (pageSize - 1)
 		if response.Zero {
 			zero := uffdioZeropageRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioZeropage, uintptr(unsafe.Pointer(&zero))); errno != 0 {
+				log.Warningf("Casimir verified-zero installation failed: %v", errno)
 				return
 			}
 			continue
 		}
 		wake := uffdioRange{Start: pageStart, Len: pageSize}
 		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioWake, uintptr(unsafe.Pointer(&wake))); errno != 0 {
+			log.Warningf("Casimir verified-page wake failed: %v", errno)
 			return
 		}
 	}
