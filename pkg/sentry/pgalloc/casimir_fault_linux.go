@@ -66,7 +66,7 @@ func startCasimirFaults(dataFile, baseFile *os.File, start uintptr, length uint6
 		0,
 		uintptr(length),
 		unix.PROT_READ,
-		unix.MAP_SHARED,
+		unix.MAP_PRIVATE,
 		baseFile.Fd(),
 		0)
 	if errno != 0 {
