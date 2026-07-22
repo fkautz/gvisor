@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -112,6 +113,7 @@ type Gofer struct {
 	specFD           int
 	mountsFD         int
 	goferToHostRPCFD int
+	casimirDataFD    int
 	profileFDs       profile.FDArgs
 	syncFDs          goferSyncFDs
 	stopProfiling    func()
@@ -145,6 +147,7 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&g.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
+	f.IntVar(&g.casimirDataFD, "casimir-data-fd", -1, "inherited Casimir fs-plane connection")
 
 	// IDs to run gofer as.
 	f.IntVar(&g.uid, "uid", 0, "User ID")
@@ -172,6 +175,23 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	containerID := f.Arg(0)
 
 	conf := args[0].(*config.Config)
+	if g.casimirDataFD < 0 {
+		if socketPath := os.Getenv("CASIMIR_DATA_SOCKET"); socketPath != "" {
+			conn, err := net.Dial("unix", socketPath)
+			if err != nil {
+				util.Fatalf("connecting Casimir fs-plane: %v", err)
+			}
+			file, err := conn.(*net.UnixConn).File()
+			conn.Close()
+			if err != nil {
+				util.Fatalf("inheriting Casimir fs-plane connection: %v", err)
+			}
+			g.casimirDataFD = int(file.Fd())
+			if _, _, errno := unix.Syscall(unix.SYS_FCNTL, file.Fd(), unix.F_SETFD, 0); errno != 0 {
+				util.Fatalf("clearing Casimir fs-plane close-on-exec: %v", errno)
+			}
+		}
+	}
 
 	// Set traceback level
 	debug.SetTraceback(conf.Traceback)
@@ -224,6 +244,9 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
 		overrides["setup-root"] = "false"
+		if g.casimirDataFD >= 0 {
+			overrides["casimir-data-fd"] = strconv.Itoa(g.casimirDataFD)
+		}
 		for key, value := range extensionPrepare.FlagOverrides {
 			overrides[key] = value
 		}
@@ -407,6 +430,15 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		EUID:               euid,
 		RGID:               rgid,
 		EGID:               egid,
+	}
+	if g.casimirDataFD >= 0 {
+		file := os.NewFile(uintptr(g.casimirDataFD), "casimir-fs-plane")
+		conn, err := net.FileConn(file)
+		file.Close()
+		if err != nil {
+			util.Fatalf("opening inherited Casimir fs-plane connection: %v", err)
+		}
+		fsgoferConf.CasimirDataConn = conn
 	}
 
 	// Create the server and start connections.
