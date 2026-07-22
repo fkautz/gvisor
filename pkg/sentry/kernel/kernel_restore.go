@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
@@ -270,6 +271,11 @@ type AsyncMFLoader struct {
 
 	loadWg  sync.WaitGroup
 	loadErr error
+
+	// baseFile, if non-nil, is the shared base memory image overlaid on the main
+	// MemoryFile during restore (GVISOR-3 C1); baseBytes is its size.
+	baseFile  *os.File
+	baseBytes uint64
 }
 
 // NewAsyncMFLoader creates a new AsyncMFLoader. It takes ownership of
@@ -279,9 +285,11 @@ type AsyncMFLoader struct {
 // If timeline is provided, it will be used to track async page loading.
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
-func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, baseFile *os.File, baseBytes uint64, timeline *timing.Timeline) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
 		privateMFsChan: make(chan map[checkpoint.ResourceID]*pgalloc.MemoryFile, 1),
+		baseFile:       baseFile,
+		baseBytes:      baseBytes,
 	}
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
@@ -314,6 +322,9 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	opts := pgalloc.LoadOpts{
 		PagesFile: apfl,
 		Timeline:  timeline,
+		// GVISOR-3 (C1): the shared base image overlays the MAIN MemoryFile only.
+		SharedBaseFile:  mfl.baseFile,
+		SharedBaseBytes: mfl.baseBytes,
 	}
 	// Note that we depend on opts.PagesFileOffset being carried between
 	// LoadFrom calls, so the same opts must be used for all calls.
@@ -329,6 +340,10 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 		log.Warningf("Failed to load main MemoryFile %p: %v", mainMF, err)
 		return
 	}
+	// The base image applies only to the main MemoryFile; private MemoryFiles
+	// (saved without a base) must load normally.
+	opts.SharedBaseFile = nil
+	opts.SharedBaseBytes = 0
 	timeline.Reached("waiting for privateMF info")
 	privateMFs := <-mfl.privateMFsChan
 	timeline.Reached("received privateMFs info")

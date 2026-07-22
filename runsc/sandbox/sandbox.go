@@ -635,6 +635,25 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 	} else {
 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
+
+	// GVISOR-3 (C1): an optional shared base memory image (base.img) in imagePath.
+	// When present, the main MemoryFile is restored over it (MAP_PRIVATE overlay +
+	// delta), so clones from a delta-only checkpoint physically share the base.
+	baseFileName := path.Join(imagePath, "base.img")
+	if bf, err := os.Open(baseFileName); err == nil {
+		fi, ferr := bf.Stat()
+		if ferr != nil {
+			bf.Close()
+			return fmt.Errorf("stat base image %q: %w", baseFileName, ferr)
+		}
+		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
+		opt.HaveBaseFile = true
+		opt.BaseFileIndex = len(opt.FilePayload.Files) - 1
+		opt.BaseFileBytes = uint64(fi.Size())
+		log.Infof("Restoring main MemoryFile over shared base image %q (%d bytes)", baseFileName, fi.Size())
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("opening base image %q failed: %w", baseFileName, err)
+	}
 	return nil
 }
 
@@ -1612,6 +1631,7 @@ type CheckpointOpts struct {
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
 	CudaCheckpointSequential  bool
+	SharedBase                bool
 
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
@@ -1674,6 +1694,17 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 	}
 	opt.FilePayload.Files = files
 	opt.HavePagesFile = len(files) > 1
+	// GVISOR-3 (C1b): add a base.img output so the sentry exports the shared base
+	// and saves a delta-only checkpoint against it.
+	if opts.SharedBase && opt.HavePagesFile {
+		basePath := filepath.Join(imagePath, "base.img")
+		bf, err := os.OpenFile(basePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("creating base image %q: %w", basePath, err)
+		}
+		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
+		opt.SharedBase = true
+	}
 	return nil
 }
 

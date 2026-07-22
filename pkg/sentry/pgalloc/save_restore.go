@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -74,6 +76,11 @@ type memoryFileSaved struct {
 	subreleased  map[uint64]uint64
 	memAcct      *memAcctSet
 	chunks       []chunkInfo
+	// baseBacked records the page ranges (start->end) whose contents were
+	// identical to the shared base at save time and were therefore excluded
+	// from the pages file (GVISOR-3 A6); on restore they are served by the
+	// base mapping rather than reloaded. Empty/nil for base-less saves.
+	baseBacked map[uint64]uint64
 }
 
 // SaveOpts provides options to MemoryFile.SaveTo().
@@ -93,6 +100,14 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// SharedBaseFile, if non-nil, is a read-only base image (in MemoryFile-offset
+	// layout, e.g. from ExportLinearBase) covering [0, SharedBaseBytes). Committed
+	// pages whose contents are identical to the base are EXCLUDED from the pages
+	// file (GVISOR-3 A6) and recorded in memoryFileSaved.baseBacked; on restore
+	// they are served by the shared base mapping rather than reloaded.
+	SharedBaseFile  *os.File
+	SharedBaseBytes uint64
 }
 
 // SaveTo writes f's state to the given stream.
@@ -172,6 +187,20 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		}
 	}
 
+	// GVISOR-3 (A6): base-aware delta exclusion. When a base image is provided,
+	// committed pages whose contents equal the base are excluded from the pages
+	// file and recorded in baseBacked (start->end). recordBaseBacked receives a
+	// maximal contiguous base-backed run (the scan coalesces by page state).
+	baseFile := opts.SharedBaseFile
+	baseBytes := opts.SharedBaseBytes
+	baseBuf := make([]byte, hostarch.PageSize)
+	baseBacked := make(map[uint64]uint64)
+	recordBaseBacked := func(fr memmap.FileRange) {
+		if fr.Length() != 0 {
+			baseBacked[fr.Start] = fr.End
+		}
+	}
+
 	// Reading an uncommitted page to determine if it is zero-filled will cause
 	// it to become committed. Thus, we need to decommit zero-filled pages that
 	// were not previously known to be committed to avoid increasing memory
@@ -227,8 +256,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		updatePendingFR           memmap.FileRange
 		updatePendingWasCommitted bool
 		updatePendingNowCommitted bool
+		updatePendingNowBase      bool
 	)
-	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
+	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
 		amount := fr.Length()
 		if amount == 0 {
 			return maseg
@@ -254,19 +284,23 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			maseg = f.memAcct.Unisolate(maseg)
 		}
 		if nowCommitted {
-			asyncWritePages(fr)
+			if nowBase {
+				recordBaseBacked(fr)
+			} else {
+				asyncWritePages(fr)
+			}
 		}
 		return maseg
 	}
 	// Precondition: maseg.Range().IsSupersetOf(fr).
 	// Postcondition: The returned memAcctIterator.Range().IsSupersetOf(fr).
-	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
-		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted {
+	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
+		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted && updatePendingNowBase == nowBase {
 			updatePendingFR.End = fr.End
 			return maseg
 		}
 		if updatePendingFR.Length() != 0 {
-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
+			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
 			if maseg.End() == fr.Start {
 				maseg = maseg.NextSegment()
 			}
@@ -274,11 +308,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		updatePendingFR = fr
 		updatePendingWasCommitted = wasCommitted
 		updatePendingNowCommitted = nowCommitted
+		updatePendingNowBase = nowBase
 		return maseg
 	}
 	updateFlush := func(maseg memAcctIterator) memAcctIterator {
 		if updatePendingFR.Length() != 0 {
-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
+			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
 		}
 		updatePendingFR = memmap.FileRange{}
 		return maseg
@@ -315,9 +350,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		allocatedBytes += fr.Length()
 		ma.commitSeq = 0
 		wasCommitted := ma.knownCommitted
-		if !opts.ExcludeCommittedZeroPages && wasCommitted {
+		if !opts.ExcludeCommittedZeroPages && wasCommitted && baseFile == nil {
 			alreadyCommittedBytes += fr.Length()
-			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */)
+			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */, false /* nowBase */)
 			maseg = updateFlush(maseg)
 			if maseg.End() == unscannedStart {
 				maseg = maseg.NextSegment()
@@ -344,7 +379,13 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 						alreadyCommittedBytes += hostarch.PageSize
 					}
 				}
-				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
+				isBase := false
+				if !isZeroed && baseFile != nil && off+hostarch.PageSize <= baseBytes {
+					if _, rerr := baseFile.ReadAt(baseBuf, int64(off)); rerr == nil {
+						isBase = bytes.Equal(pg, baseBuf)
+					}
+				}
+				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed, isBase)
 			}
 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
 			// occasionally unlock f.mu to ensure that the former can promptly
@@ -394,13 +435,16 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		subreleased:  f.subreleased,
 		memAcct:      &f.memAcct,
 		chunks:       f.chunksLoad(),
+		baseBacked:   baseBacked,
 	}); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
 	if amfs == nil {
-		// Save committed pages.
+		// Save committed pages, excluding base-backed pages (GVISOR-3 A6) so the
+		// stream carries only the delta; symmetric with the load loop above.
+		baseBackedList := sortedRanges(baseBacked)
 		ww := wire.Writer{Writer: w}
 		timePagesStart := gohacks.Nanotime()
 		bytesSaved := uint64(0)
@@ -408,21 +452,20 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			if !maseg.ValuePtr().knownCommitted {
 				continue
 			}
-			maFR := maseg.Range()
-			// Write a header to distinguish from objects.
-			if err := state.WriteHeader(&ww, maFR.Length(), false); err != nil {
-				return err
-			}
-			// Write out data.
-			var ioErr error
-			f.forEachMappingSlice(maFR, func(s []byte) {
-				if ioErr != nil {
-					return
+			for _, dfr := range deltaSubRanges(maseg.Range(), baseBackedList) {
+				if err := state.WriteHeader(&ww, dfr.Length(), false); err != nil {
+					return err
 				}
-				_, ioErr = w.Write(s)
-			})
-			if ioErr != nil {
-				return ioErr
+				var ioErr error
+				f.forEachMappingSlice(dfr, func(s []byte) {
+					if ioErr != nil {
+						return
+					}
+					_, ioErr = w.Write(s)
+				})
+				if ioErr != nil {
+					return ioErr
+				}
 			}
 		}
 		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
@@ -920,6 +963,15 @@ type LoadOpts struct {
 	// ownership of this timeline remains in the hands of the caller of
 	// LoadFrom.
 	Timeline *timing.Timeline
+
+	// SharedBaseFile, if non-nil, is a read-only base image covering
+	// [0, SharedBaseBytes) (GVISOR-3 B1). On restore, that range is overlaid
+	// MAP_PRIVATE from this file so base-backed pages (memoryFileSaved.baseBacked)
+	// are served by the shared base copy-on-write; base-range delta pages COW the
+	// mapping when loaded. Requires the synchronous pages path (PagesFile nil) in
+	// this prototype (see finding F8: the async loader writes to the memfd FD).
+	SharedBaseFile  *os.File
+	SharedBaseBytes uint64
 }
 
 // LoadFrom loads MemoryFile state from the given stream.
@@ -947,6 +999,12 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	f.memAcct.MoveFrom(mfs.memAcct)
 	chunks := mfs.chunks
 	f.chunks.Store(&chunks)
+	// GVISOR-3 (B1): base-backed ranges are excluded from the pages stream and
+	// served by the shared base overlay below; both load loops skip them.
+	baseBackedList := sortedRanges(mfs.baseBacked)
+	if len(mfs.baseBacked) != 0 && opts.SharedBaseFile == nil {
+		return fmt.Errorf("checkpoint has %d base-backed ranges but no SharedBaseFile was provided", len(mfs.baseBacked))
+	}
 	mfTimeline.Reached("metadata loaded")
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
@@ -973,10 +1031,34 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
 		}
 		mfTimeline.Reached("mmaped chunks")
+		mapStart := m
 		for i := range chunks {
 			chunk := &chunks[i]
 			chunk.mapping = m
 			m += chunkSize
+		}
+		// GVISOR-3 (B1/F8): overlay [0, SharedBaseBytes) of the restore mapping
+		// MAP_PRIVATE from the shared base, so base-backed pages are served by the
+		// shared base (copy-on-write) instead of the per-sandbox memfd, and
+		// base-range delta pages COW the mapping when written below.
+		if opts.SharedBaseFile != nil {
+			hi := opts.SharedBaseBytes
+			if hi > fileSize {
+				hi = fileSize
+			}
+			if hi > 0 {
+				if _, _, errno := unix.Syscall6(unix.SYS_MMAP,
+					mapStart, uintptr(hi),
+					unix.PROT_READ|unix.PROT_WRITE,
+					unix.MAP_PRIVATE|unix.MAP_FIXED,
+					opts.SharedBaseFile.Fd(), 0); errno != 0 {
+					return fmt.Errorf("failed to overlay shared base: %w", errno)
+				}
+			}
+			// Record the base range on f so Decommit/accounting (A4/A5) treat the
+			// base range as overlay-backed (MADV_DONTNEED), not f.file-backed.
+			f.opts.SharedBaseFile = opts.SharedBaseFile
+			f.opts.SharedBaseBytes = opts.SharedBaseBytes
 		}
 		madviseWG.Add(1)
 		go func() {
@@ -1062,42 +1144,48 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			<-madviseChan
 		}
 		if amfl != nil {
-			// Record where to read data.
-			if !minUnloadedInit {
-				minUnloadedInit = true
-				amfl.minUnloaded.Store(maFR.Start)
-			}
-			amfl.pf.mu.Lock()
-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: opts.PagesFileOffset,
-			})
-			amfl.pf.mu.Unlock()
-			opts.PagesFileOffset += amount
-			amfl.pf.lfStatus.Notify(aplLFPending)
-		} else {
-			// Verify header.
-			length, object, err := state.ReadHeader(&wr)
-			if err != nil {
-				return fmt.Errorf("failed to read header: %w", err)
-			}
-			if object {
-				// Not expected.
-				return fmt.Errorf("unexpected object")
-			}
-			if length != amount {
-				// Size mismatch.
-				return fmt.Errorf("mismatched segment: expected %d, got %d", amount, length)
-			}
-			// Read data.
-			var ioErr error
-			f.forEachMappingSlice(maFR, func(s []byte) {
-				if ioErr != nil {
-					return
+			// Record where to read data for each delta sub-range; base-backed
+			// pages are served by the MAP_PRIVATE base overlay (GVISOR-3 B1/B2)
+			// and are absent from the pages file, so skip them symmetrically with
+			// save. The async loader reads each range into the mapping memory,
+			// COWing the base overlay for base-range delta pages.
+			for _, dfr := range deltaSubRanges(maFR, baseBackedList) {
+				if !minUnloadedInit {
+					minUnloadedInit = true
+					amfl.minUnloaded.Store(dfr.Start)
 				}
-				_, ioErr = io.ReadFull(r, s)
-			})
-			if ioErr != nil {
-				return fmt.Errorf("failed to read pages: %w", ioErr)
+				amfl.pf.mu.Lock()
+				amfl.unloaded.InsertRange(dfr, aplUnloadedInfo{
+					off: opts.PagesFileOffset,
+				})
+				amfl.pf.mu.Unlock()
+				opts.PagesFileOffset += dfr.Length()
+				amfl.pf.lfStatus.Notify(aplLFPending)
+			}
+		} else {
+			// Read each delta sub-range (base-backed pages are skipped; their
+			// content comes from the MAP_PRIVATE base overlay).
+			for _, dfr := range deltaSubRanges(maFR, baseBackedList) {
+				length, object, err := state.ReadHeader(&wr)
+				if err != nil {
+					return fmt.Errorf("failed to read header: %w", err)
+				}
+				if object {
+					return fmt.Errorf("unexpected object")
+				}
+				if length != dfr.Length() {
+					return fmt.Errorf("mismatched segment: expected %d, got %d", dfr.Length(), length)
+				}
+				var ioErr error
+				f.forEachMappingSlice(dfr, func(s []byte) {
+					if ioErr != nil {
+						return
+					}
+					_, ioErr = io.ReadFull(r, s)
+				})
+				if ioErr != nil {
+					return fmt.Errorf("failed to read pages: %w", ioErr)
+				}
 			}
 		}
 
@@ -2008,4 +2096,48 @@ func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.Clien
 		return true
 	})
 	return cfrs
+}
+
+// sortedRanges converts a start->end map (e.g. memoryFileSaved.baseBacked) into a
+// slice of FileRanges sorted ascending by Start (GVISOR-3).
+func sortedRanges(m map[uint64]uint64) []memmap.FileRange {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]memmap.FileRange, 0, len(m))
+	for st, en := range m {
+		out = append(out, memmap.FileRange{Start: st, End: en})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+	return out
+}
+
+// deltaSubRanges returns the sub-ranges of seg not covered by any range in bb
+// (bb sorted ascending, non-overlapping). With bb empty it returns [seg], so the
+// non-base save/restore wire format is unchanged (GVISOR-3 B1).
+func deltaSubRanges(seg memmap.FileRange, bb []memmap.FileRange) []memmap.FileRange {
+	if len(bb) == 0 {
+		return []memmap.FileRange{seg}
+	}
+	var out []memmap.FileRange
+	cur := seg.Start
+	for _, r := range bb {
+		if r.End <= cur || r.Start >= seg.End {
+			continue
+		}
+		st := r.Start
+		if st < cur {
+			st = cur
+		}
+		if st > cur {
+			out = append(out, memmap.FileRange{Start: cur, End: st})
+		}
+		if r.End > cur {
+			cur = r.End
+		}
+	}
+	if cur < seg.End {
+		out = append(out, memmap.FileRange{Start: cur, End: seg.End})
+	}
+	return out
 }

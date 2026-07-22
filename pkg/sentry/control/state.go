@@ -17,6 +17,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -82,6 +83,10 @@ type SaveOpts struct {
 	// HavePagesFile indicates whether the pages file and its corresponding
 	// metadata file is provided.
 	HavePagesFile bool `json:"have_pages_file"`
+
+	// SharedBase indicates a base.img output is appended to FilePayload (GVISOR-3
+	// C1b): the sentry exports the shared base and saves a delta-only checkpoint.
+	SharedBase bool `json:"shared_base"`
 
 	// FilePayload contains the following:
 	// 1. checkpoint state file.
@@ -154,6 +159,9 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 	if o.HavePagesFile {
 		wantFiles += 2
 	}
+	if o.SharedBase {
+		wantFiles++
+	}
 	if gotFiles := len(o.FilePayload.Files); gotFiles != wantFiles {
 		return fmt.Errorf("got %d files, wanted %d", gotFiles, wantFiles)
 	}
@@ -182,6 +190,13 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 			return err
 		}
 		saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(pagesFileFD))
+	}
+	if o.SharedBase {
+		baseFD, err := unix.Dup(int(o.Files[3].Fd()))
+		if err != nil {
+			return err
+		}
+		saveOpts.SharedBaseFile = os.NewFile(uintptr(baseFD), "base.img")
 	}
 	return nil
 }
