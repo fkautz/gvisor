@@ -28,7 +28,7 @@ const (
 	// registration, wake, and verified zero installation.
 	uffdioAPI      = 0xc018aa3f
 	uffdioRegister = 0xc020aa00
-	uffdioWake     = 0x8010aa02
+	uffdioCopy     = 0xc028aa03
 	uffdioZeropage = 0xc020aa04
 )
 
@@ -40,7 +40,7 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
 			unix.SYS_IOCTL: seccomp.Or{
 				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioAPI)},
 				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioRegister)},
-				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioWake)},
+				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioCopy)},
 				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioZeropage)},
 				seccomp.PerArg{
 					seccomp.NonNegativeFD{},
