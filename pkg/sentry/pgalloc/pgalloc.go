@@ -23,6 +23,7 @@
 package pgalloc
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"os"
@@ -384,6 +385,14 @@ type MemoryFileOpts struct {
 	// If DisableMemoryAccounting is true, memory usage observed by the
 	// MemoryFile will not be reported in usage.MemoryAccounting.
 	DisableMemoryAccounting bool
+
+	// SharedBaseFile, if non-nil, backs the chunk range [0, SharedBaseBytes)
+	// with a MAP_PRIVATE mapping of this read-only file (GVISOR-3 shared
+	// copy-on-write base): resident base pages are physically shared across
+	// MemoryFiles using the same file, and writes fault to private copies.
+	// EXPERIMENTAL (S1): not yet integrated with restore/decommit/save.
+	SharedBaseFile  *os.File
+	SharedBaseBytes uint64
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -951,6 +960,34 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 			m += chunkSize
 		}
 	}
+	// GVISOR-3 (S1): back base-range chunks with a MAP_PRIVATE mapping of the
+	// shared base file so resident base pages are shared copy-on-write across
+	// MemoryFiles and writes fault to private copies.
+	if f.opts.SharedBaseFile != nil {
+		for i := oldNrChunks; i < newNrChunks; i++ {
+			if newChunks[i].mapping == 0 {
+				continue
+			}
+			// Overlay the [0, SharedBaseBytes) portion of this chunk MAP_PRIVATE from
+			// the shared base file; any remainder stays MAP_SHARED on f.file. This
+			// shares sub-1-GiB bases too, since chunkSize is 1 GiB.
+			off := i * chunkSize
+			hi := off + chunkSize
+			if hi > f.opts.SharedBaseBytes {
+				hi = f.opts.SharedBaseBytes
+			}
+			if off >= hi {
+				continue
+			}
+			if _, _, errno := unix.Syscall6(unix.SYS_MMAP,
+				newChunks[i].mapping, uintptr(hi-off),
+				unix.PROT_READ|unix.PROT_WRITE,
+				unix.MAP_PRIVATE|unix.MAP_FIXED,
+				f.opts.SharedBaseFile.Fd(), uintptr(off)); errno != 0 {
+				return errno
+			}
+		}
+	}
 	f.chunks.Store(&newChunks)
 
 	// Mark void pages free.
@@ -960,6 +997,102 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	})
 
 	return nil
+}
+
+// ExportLinearBase writes the committed contents of the MemoryFile to out as a
+// sparse, guest-address-linear base image (out offset O == MemoryFile offset O),
+// usable as MemoryFileOpts.SharedBaseFile in other MemoryFiles (GVISOR-3 S2). The
+// backing memfd is already laid out linearly (chunk i at file offset i*chunkSize),
+// so only its data extents (SEEK_DATA/SEEK_HOLE) are copied and out stays sparse.
+func (f *MemoryFile) ExportLinearBase(out *os.File) (uint64, error) {
+	size := int64(uint64(len(f.chunksLoad())) * chunkSize)
+	if err := out.Truncate(size); err != nil {
+		return 0, err
+	}
+	infd, outfd := int(f.file.Fd()), int(out.Fd())
+	buf := make([]byte, 1<<20)
+	for off := int64(0); off < size; {
+		data, err := unix.Seek(infd, off, unix.SEEK_DATA)
+		if err != nil {
+			break
+		}
+		hole, err := unix.Seek(infd, data, unix.SEEK_HOLE)
+		if err != nil {
+			hole = size
+		}
+		for pos := data; pos < hole; {
+			n := int64(len(buf))
+			if hole-pos < n {
+				n = hole - pos
+			}
+			rn, rerr := unix.Pread(infd, buf[:n], pos)
+			if rn > 0 {
+				if _, werr := unix.Pwrite(outfd, buf[:rn], pos); werr != nil {
+					return 0, werr
+				}
+				pos += int64(rn)
+			}
+			if rerr != nil || rn == 0 {
+				break
+			}
+		}
+		off = hole
+	}
+	return uint64(size), nil
+}
+
+// BaseBackedRanges returns the committed page ranges in [0, baseBytes) whose
+// contents are byte-identical to the shared base file (GVISOR-3 F5: delta
+// computation). On checkpoint these pages need not be written to the pages file
+// (A6); on restore they are satisfied by the MAP_PRIVATE base mapping (S1/B1),
+// so both save and load must skip this set symmetrically. The complement of this
+// set within fs committed pages (plus any committed pages at or beyond
+// baseBytes) is the per-agent memory delta that must be saved and reloaded. The
+// returned ranges are coalesced and ascending. BaseBackedRanges is read-only
+// with respect to f.
+func (f *MemoryFile) BaseBackedRanges(base *os.File, baseBytes uint64) ([]memmap.FileRange, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []memmap.FileRange
+	buf := make([]byte, hostarch.PageSize)
+	var loopErr error
+	addPage := func(off uint64) {
+		if n := len(out); n > 0 && out[n-1].End == off {
+			out[n-1].End = off + hostarch.PageSize
+		} else {
+			out = append(out, memmap.FileRange{off, off + hostarch.PageSize})
+		}
+	}
+	// Iterate accounted (allocated) ranges. knownCommitted is a lazy flag set by
+	// UpdateUsage, so it is not relied on here; comparing accounted page contents
+	// to the base is the source of truth for base-identity.
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		fr := maseg.Range()
+		if fr.Start >= baseBytes {
+			continue // entirely beyond the base: all delta
+		}
+		if fr.End > baseBytes {
+			fr.End = baseBytes
+		}
+		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			bs := chunk.sliceAt(chunkFR)
+			for pgoff := 0; pgoff+hostarch.PageSize <= len(bs); pgoff += hostarch.PageSize {
+				off := chunkFR.Start + uint64(pgoff)
+				if _, err := base.ReadAt(buf, int64(off)); err != nil {
+					loopErr = err
+					return false
+				}
+				if bytes.Equal(bs[pgoff:pgoff+hostarch.PageSize], buf) {
+					addPage(off)
+				}
+			}
+			return true
+		})
+		if loopErr != nil {
+			return nil, loopErr
+		}
+	}
+	return out, nil
 }
 
 func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
@@ -1132,6 +1265,31 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
+	// GVISOR-3 (A4): base-range pages are served by the MAP_PRIVATE base overlay,
+	// not by f.file. Drop them with MADV_DONTNEED, which frees any COW-dirty private
+	// copies and reverts the range to the shared base on next access; fallocate-
+	// punching f.file would not affect the overlay. Pages beyond the base (or with no
+	// base) are decommitted normally via f.file.
+	if f.opts.SharedBaseFile != nil && fr.Start < f.opts.SharedBaseBytes {
+		baseFR := fr
+		if baseFR.End > f.opts.SharedBaseBytes {
+			baseFR.End = f.opts.SharedBaseBytes
+		}
+		f.forEachChunk(baseFR, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			if chunk.mapping == 0 {
+				return true
+			}
+			addr := chunk.mapping + uintptr(chunkFR.Start%chunkSize)
+			if _, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, uintptr(chunkFR.Length()), unix.MADV_DONTNEED); errno != 0 {
+				log.Warningf("MADV_DONTNEED base range %v failed: %v", chunkFR, errno)
+			}
+			return true
+		})
+		if fr.End <= f.opts.SharedBaseBytes {
+			return
+		}
+		fr.Start = f.opts.SharedBaseBytes // decommit the beyond-base remainder below
+	}
 	if err := f.decommitFile(fr); err != nil {
 		log.Warningf("Failed to decommit %v: %v", fr, err)
 		// Zero the pages manually. This won't reduce memory usage, but at
