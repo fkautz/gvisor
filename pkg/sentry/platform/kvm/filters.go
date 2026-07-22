@@ -22,12 +22,26 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
+const (
+	// These ioctl request numbers are defined by linux/userfaultfd.h. Casimir's
+	// verified shared-base handler needs only negotiation, missing-page
+	// registration, wake, and verified zero installation.
+	uffdioAPI      = 0xc018aa3f
+	uffdioRegister = 0xc020aa00
+	uffdioWake     = 0x8010aa02
+	uffdioZeropage = 0xc020aa04
+)
+
 // SeccompInfo returns seccomp information for the KVM platform.
 func (k *KVM) SeccompInfo() platform.SeccompInfo {
 	return platform.StaticSeccompInfo{
 		PlatformName: "kvm",
 		Filters: k.archSyscallFilters().Merge(seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			unix.SYS_IOCTL: seccomp.Or{
+				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioAPI)},
+				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioRegister)},
+				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioWake)},
+				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioZeropage)},
 				seccomp.PerArg{
 					seccomp.NonNegativeFD{},
 					seccomp.EqualTo(KVM_RUN),
