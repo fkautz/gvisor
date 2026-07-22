@@ -20,6 +20,7 @@ const (
 	uffdioAPI               = 0xc018aa3f
 	uffdioRegister          = 0xc020aa00
 	uffdioWake              = 0x8010aa02
+	uffdioZeropage          = 0xc020aa04
 	uffdioRegisterMissing   = 1
 )
 
@@ -36,6 +37,12 @@ type uffdioRegisterRequest struct {
 	Mode, IOCTLs uint64
 }
 
+type uffdioZeropageRequest struct {
+	Range    uffdioRange
+	Mode     uint64
+	Zeropage int64
+}
+
 type casimirFaultRequest struct {
 	Operation string `json:"operation"`
 	Offset    uint64 `json:"offset"`
@@ -44,6 +51,7 @@ type casimirFaultRequest struct {
 
 type casimirFaultResponse struct {
 	Error string `json:"error,omitempty"`
+	Zero  bool   `json:"zero,omitempty"`
 }
 
 func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
@@ -111,7 +119,15 @@ func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
 		if err := json.NewDecoder(rw).Decode(&response); err != nil || response.Error != "" {
 			return
 		}
-		wake := uffdioRange{Start: address &^ (pageSize - 1), Len: pageSize}
+		pageStart := address &^ (pageSize - 1)
+		if response.Zero {
+			zero := uffdioZeropageRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
+			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioZeropage, uintptr(unsafe.Pointer(&zero))); errno != 0 {
+				return
+			}
+			continue
+		}
+		wake := uffdioRange{Start: pageStart, Len: pageSize}
 		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioWake, uintptr(unsafe.Pointer(&wake))); errno != 0 {
 			return
 		}
