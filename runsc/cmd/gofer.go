@@ -462,7 +462,11 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 			}
 		}
 		if connImpl == nil {
-			connImpl = fsgofer.NewConnectionImpl(fsgoferConf)
+			connectionConf := *fsgoferConf
+			if cfg.mountPath != "/" {
+				connectionConf.CasimirDataConn = nil
+			}
+			connImpl = fsgofer.NewConnectionImpl(&connectionConf)
 			connOpts = fsgofer.ConnectionOpts(cfg.readonly)
 		}
 		conn, err := server.CreateConnection(cfg.sock, cfg.mountPath, connOpts, connImpl)

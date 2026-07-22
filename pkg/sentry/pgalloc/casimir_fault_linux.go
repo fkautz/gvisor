@@ -13,13 +13,14 @@ import (
 )
 
 const (
-	uffdAPI               = 0xAA
-	uffdEventPagefault    = 0x12
-	uffdUserModeOnly      = 1
-	uffdioAPI             = 0xc018aa3f
-	uffdioRegister        = 0xc020aa00
-	uffdioWake            = 0x8010aa02
-	uffdioRegisterMissing = 1
+	uffdAPI                 = 0xAA
+	uffdEventPagefault      = 0x12
+	uffdUserModeOnly        = 1
+	uffdFeatureMissingShmem = 1 << 5
+	uffdioAPI               = 0xc018aa3f
+	uffdioRegister          = 0xc020aa00
+	uffdioWake              = 0x8010aa02
+	uffdioRegisterMissing   = 1
 )
 
 type uffdioAPIRequest struct {
@@ -50,10 +51,14 @@ func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
 	if errno != 0 {
 		return errno
 	}
-	api := uffdioAPIRequest{API: uffdAPI}
+	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); errno != 0 {
 		unix.Close(int(fd))
 		return errno
+	}
+	if api.Features&uffdFeatureMissingShmem == 0 {
+		unix.Close(int(fd))
+		return unix.ENOTSUP
 	}
 	registration := uffdioRegisterRequest{Range: uffdioRange{Start: uint64(start), Len: length}, Mode: uffdioRegisterMissing}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); errno != 0 {
