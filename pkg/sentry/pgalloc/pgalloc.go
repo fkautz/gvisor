@@ -200,6 +200,10 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
 
+	// casimirFaults is nonzero when missing shared-base pages are resolved by
+	// the authenticated Casimir userfaultfd channel.
+	casimirFaults atomicbitops.Uint32 `state:"nosave"`
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -1610,13 +1614,29 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		f.forEachMappingSlice(fr, func(bs []byte) {
 			seq = safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bs))
 		})
+		f.prefetchCasimirMappings(seq)
 		return seq, nil
 	}
 	blocks := make([]safemem.Block, 0, chunks)
 	f.forEachMappingSlice(fr, func(bs []byte) {
 		blocks = append(blocks, safemem.BlockFromSafeSlice(bs))
 	})
-	return safemem.BlockSeqFromSlice(blocks), nil
+	seq := safemem.BlockSeqFromSlice(blocks)
+	f.prefetchCasimirMappings(seq)
+	return seq, nil
+}
+
+func (f *MemoryFile) prefetchCasimirMappings(seq safemem.BlockSeq) {
+	if f.casimirFaults.Load() == 0 {
+		return
+	}
+	for !seq.IsEmpty() {
+		bytes := seq.Head().ToSlice()
+		for offset := 0; offset < len(bytes); offset += hostarch.PageSize {
+			_ = bytes[offset]
+		}
+		seq = seq.Tail()
+	}
 }
 
 // forEachMappingSlice invokes fn on a sequence of byte slices that

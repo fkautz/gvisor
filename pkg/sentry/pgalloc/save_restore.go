@@ -1066,6 +1066,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				if err := startCasimirFaults(opts.CasimirDataFile, mapStart, hi); err != nil {
 					return fmt.Errorf("start Casimir shared-base faults: %w", err)
 				}
+				f.casimirFaults.Store(1)
 			}
 		}
 		madviseWG.Add(1)
@@ -1459,6 +1460,12 @@ func (apfl *AsyncPagesFileLoad) MemoryFilesDone() {
 // failed permanently.
 func (f *MemoryFile) IsAsyncLoading() bool {
 	return f.asyncPageLoad.Load() != nil
+}
+
+// UsesCasimirFaults returns true when KVM must pre-touch mapped pages through
+// the Sentry before installing guest page-table entries.
+func (f *MemoryFile) UsesCasimirFaults() bool {
+	return f.casimirFaults.Load() != 0
 }
 
 // AwaitLoadAll blocks until async page loading has completed. If async page
