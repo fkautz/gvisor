@@ -1614,7 +1614,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		f.forEachMappingSlice(fr, func(bs []byte) {
 			seq = safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bs))
 		})
-		f.prefetchCasimirMappings(seq)
+		if err := f.prefetchCasimirMappings(seq); err != nil {
+			return safemem.BlockSeq{}, err
+		}
 		return seq, nil
 	}
 	blocks := make([]safemem.Block, 0, chunks)
@@ -1622,21 +1624,26 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		blocks = append(blocks, safemem.BlockFromSafeSlice(bs))
 	})
 	seq := safemem.BlockSeqFromSlice(blocks)
-	f.prefetchCasimirMappings(seq)
+	if err := f.prefetchCasimirMappings(seq); err != nil {
+		return safemem.BlockSeq{}, err
+	}
 	return seq, nil
 }
 
-func (f *MemoryFile) prefetchCasimirMappings(seq safemem.BlockSeq) {
+func (f *MemoryFile) prefetchCasimirMappings(seq safemem.BlockSeq) error {
 	if f.casimirFaults.Load() == 0 {
-		return
+		return nil
 	}
 	for !seq.IsEmpty() {
 		bytes := seq.Head().ToSlice()
 		for offset := 0; offset < len(bytes); offset += hostarch.PageSize {
-			_ = bytes[offset]
+			if _, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes[offset:])); err != nil {
+				return err
+			}
 		}
 		seq = seq.Tail()
 	}
+	return nil
 }
 
 // forEachMappingSlice invokes fn on a sequence of byte slices that
