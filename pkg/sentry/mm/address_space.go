@@ -66,6 +66,11 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	} else if mapUnit := mm.p.MapUnit(); mapUnit != 0 {
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
+	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.UsesCasimirFaults() {
+		// KVM cannot service a missing userfaultfd-backed shmem page itself: it
+		// reports a direct-mapping NMI/SIGBUS. Map only the faulting page so
+		// MemoryFile.MapInternal can resolve that exact page before guest resume.
+		setMapUnit(hostarch.PageSize)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
 		// Impose an arbitrary mapUnit in order to avoid calling
 		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()

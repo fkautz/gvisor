@@ -92,6 +92,45 @@ func TestSharedBaseCOW(t *testing.T) {
 	}
 }
 
+func TestCasimirMapInternalPrefetchesMissingPage(t *testing.T) {
+	backing, err := os.CreateTemp("", "casimir-prefetch-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(backing.Name())
+	mf, err := NewMemoryFile(backing, MemoryFileOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	fr, err := mf.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := mf.MapInternal(fr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := seq.Head().ToSlice()
+	resident := []byte{0}
+	if err := mincore(page, resident); err != nil {
+		t.Fatal(err)
+	}
+	if resident[0]&1 != 0 {
+		t.Fatal("uncommitted page unexpectedly resident before Casimir prefetch")
+	}
+	mf.casimirFaults.Store(1)
+	if _, err := mf.MapInternal(fr, hostarch.Read); err != nil {
+		t.Fatal(err)
+	}
+	if err := mincore(page, resident); err != nil {
+		t.Fatal(err)
+	}
+	if resident[0]&1 == 0 {
+		t.Fatal("Casimir MapInternal did not prefetch missing page")
+	}
+}
+
 func TestExportLinearBaseAndShare(t *testing.T) {
 	mkMF := func(opts MemoryFileOpts) *MemoryFile {
 		b, err := os.CreateTemp("", "llifs-mf-*")
