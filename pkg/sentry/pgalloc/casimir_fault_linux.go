@@ -19,11 +19,15 @@ const (
 	uffdEventPagefault      = 0x12
 	uffdUserModeOnly        = 1
 	uffdFeatureMissingShmem = 1 << 5
+	uffdFeatureMinorShmem   = 1 << 10
 	uffdioAPI               = 0xc018aa3f
 	uffdioRegister          = 0xc020aa00
 	uffdioCopy              = 0xc028aa03
 	uffdioZeropage          = 0xc020aa04
+	uffdioContinue          = 0xc020aa07
 	uffdioRegisterMissing   = 1
+	uffdioRegisterMinor     = 4
+	uffdPagefaultFlagMinor  = 1 << 2
 )
 
 type uffdioAPIRequest struct {
@@ -50,16 +54,33 @@ type uffdioCopyRequest struct {
 	Copy                int64
 }
 
+type uffdioContinueRequest struct {
+	Range  uffdioRange
+	Mode   uint64
+	Mapped int64
+}
+
 type casimirFaultRequest struct {
 	Operation string `json:"operation"`
+	FaultMode string `json:"fault_mode,omitempty"`
 	Offset    uint64 `json:"offset"`
 	Length    uint64 `json:"length"`
 }
 
+type casimirRegion struct {
+	GuestStart uint64 `json:"guest_start"`
+	Length     uint64 `json:"length"`
+	State      uint8  `json:"state"`
+	Protection uint8  `json:"protection"`
+	Flags      uint8  `json:"flags"`
+}
+
 type casimirFaultResponse struct {
-	Error string `json:"error,omitempty"`
-	Zero  bool   `json:"zero,omitempty"`
-	Data  []byte `json:"data,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Zero     bool            `json:"zero,omitempty"`
+	Continue bool            `json:"continue,omitempty"`
+	Data     []byte          `json:"data,omitempty"`
+	Regions  []casimirRegion `json:"regions,omitempty"`
 }
 
 func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
@@ -87,18 +108,58 @@ func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
 		unix.Close(int(fd))
 		return err
 	}
-	go serveCasimirFaults(int(fd), conn, uint64(start), length)
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	if err := consumeCasimirMappings(rw, length); err != nil {
+		conn.Close()
+		unix.Close(int(fd))
+		return err
+	}
+	go serveCasimirFaults(int(fd), conn, rw, uint64(start), length)
 	return nil
 }
 
-func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
+// consumeCasimirMappings consumes the complete signed layout region table
+// before any guest fault is served (MLAYOUT-5). The table must tile the exact
+// shared-base span with valid signed states; any gap, overlap, or unknown
+// state fails the restore closed before guest resume.
+func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) error {
+	if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "mappings"}); err != nil {
+		return err
+	}
+	if err := rw.Flush(); err != nil {
+		return err
+	}
+	var response casimirFaultResponse
+	if err := json.NewDecoder(rw).Decode(&response); err != nil {
+		return err
+	}
+	if response.Error != "" || len(response.Regions) == 0 {
+		log.Warningf("Casimir mapping table rejected: error=%q regions=%d", response.Error, len(response.Regions))
+		return unix.EINVAL
+	}
+	var next uint64
+	for _, region := range response.Regions {
+		if region.GuestStart != next || region.Length == 0 || region.State < 1 || region.State > 3 {
+			log.Warningf("Casimir mapping table is not a contiguous signed tiling at %#x", region.GuestStart)
+			return unix.EINVAL
+		}
+		next += region.Length
+	}
+	if next != length {
+		log.Warningf("Casimir mapping table covers %#x bytes, want %#x", next, length)
+		return unix.EINVAL
+	}
+	log.Infof("Casimir signed mapping table consumed: %d regions over %#x bytes", len(response.Regions), length)
+	return nil
+}
+
+func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, length uint64) {
 	defer unix.Close(uffd)
 	defer conn.Close()
 	// Any loss or rejection of the verifier channel leaves a missing page
 	// unresolved. Terminate the Sentry instead of permitting zero-fill or a
 	// private fallback.
 	defer unix.Kill(os.Getpid(), unix.SIGKILL)
-	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	var msg [32]byte
 	pageSize := uint64(os.Getpagesize())
 	for {
@@ -127,7 +188,12 @@ func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
 			return
 		}
 		offset := address - start
-		if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", Offset: offset, Length: pageSize}); err != nil {
+		flags := *(*uint64)(unsafe.Pointer(&msg[8]))
+		mode := "missing"
+		if flags&uffdPagefaultFlagMinor != 0 {
+			mode = "minor"
+		}
+		if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", FaultMode: mode, Offset: offset, Length: pageSize}); err != nil {
 			log.Warningf("Casimir fault request failed: %v", err)
 			return
 		}
@@ -141,6 +207,22 @@ func serveCasimirFaults(uffd int, conn net.Conn, start, length uint64) {
 			return
 		}
 		pageStart := address &^ (pageSize - 1)
+		if response.Continue {
+			if mode != "minor" {
+				log.Warningf("Casimir continuation for non-minor fault at %#x", address)
+				return
+			}
+			request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
+			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
+				log.Warningf("Casimir resident-page continuation failed: %v", errno)
+				return
+			}
+			continue
+		}
+		if mode != "missing" {
+			log.Warningf("Casimir non-continuation response for minor fault at %#x", address)
+			return
+		}
 		if response.Zero {
 			zero := uffdioZeropageRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioZeropage, uintptr(unsafe.Pointer(&zero))); errno != 0 {
