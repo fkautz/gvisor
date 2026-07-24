@@ -1637,6 +1637,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		f.forEachMappingSlice(fr, func(bs []byte) {
 			seq = safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bs))
 		})
+		if err := f.prefetchCasimirPrivateMappings(seq); err != nil {
+			return safemem.BlockSeq{}, err
+		}
 		return seq, nil
 	}
 	blocks := make([]safemem.Block, 0, chunks)
@@ -1644,6 +1647,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		blocks = append(blocks, safemem.BlockFromSafeSlice(bs))
 	})
 	seq := safemem.BlockSeqFromSlice(blocks)
+	if err := f.prefetchCasimirPrivateMappings(seq); err != nil {
+		return safemem.BlockSeq{}, err
+	}
 	return seq, nil
 }
 
@@ -1667,6 +1673,26 @@ func (f *MemoryFile) prefetchCasimirRange(fr memmap.FileRange) error {
 		if _, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (f *MemoryFile) prefetchCasimirPrivateMappings(seq safemem.BlockSeq) error {
+	if f.casimirFaults.Load() == 0 {
+		return nil
+	}
+	// The shared alias touch above establishes verified residency and selects
+	// MISSING or MINOR. Touch the unregistered MAP_PRIVATE overlay only after
+	// that wakeup so KVM receives populated host mappings while guest writes
+	// retain normal copy-on-write behavior.
+	for !seq.IsEmpty() {
+		bytes := seq.Head().ToSlice()
+		for offset := 0; offset < len(bytes); offset += hostarch.PageSize {
+			if _, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes[offset:])); err != nil {
+				return err
+			}
+		}
+		seq = seq.Tail()
 	}
 	return nil
 }
