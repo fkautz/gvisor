@@ -192,6 +192,7 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 		if flags&uffdPagefaultFlagMinor != 0 {
 			mode = "minor"
 		}
+		log.Infof("Casimir fault: offset=%#x mode=%s flags=%#x", offset, mode, flags)
 		if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", FaultMode: mode, Offset: offset, Length: pageSize}); err != nil {
 			log.Warningf("Casimir fault request failed: %v", err)
 			return
@@ -215,9 +216,10 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 			// No per-sandbox private copy of an absent page is ever installed.
 			request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
-				log.Warningf("Casimir shared-backing continuation failed: %v", errno)
+				log.Warningf("Casimir shared-backing continuation failed at %#x: %v", offset, errno)
 				return
 			}
+			log.Infof("Casimir continued %#x mapped=%d", offset, request.Mapped)
 			continue
 		}
 		if mode != "missing" {
