@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net"
 	"os"
-	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -88,16 +87,16 @@ func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
 	if errno != 0 {
 		return errno
 	}
-	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem}
+	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem | uffdFeatureMinorShmem}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); errno != 0 {
 		unix.Close(int(fd))
 		return errno
 	}
-	if api.Features&uffdFeatureMissingShmem == 0 {
+	if api.Features&uffdFeatureMissingShmem == 0 || api.Features&uffdFeatureMinorShmem == 0 {
 		unix.Close(int(fd))
 		return unix.ENOTSUP
 	}
-	registration := uffdioRegisterRequest{Range: uffdioRange{Start: uint64(start), Len: length}, Mode: uffdioRegisterMissing}
+	registration := uffdioRegisterRequest{Range: uffdioRange{Start: uint64(start), Len: length}, Mode: uffdioRegisterMissing | uffdioRegisterMinor}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); errno != 0 {
 		unix.Close(int(fd))
 		return errno
@@ -208,13 +207,15 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 		}
 		pageStart := address &^ (pageSize - 1)
 		if response.Continue {
-			if mode != "minor" {
-				log.Warningf("Casimir continuation for non-minor fault at %#x", address)
-				return
-			}
+			// COW-6a: both a resident block (minor fault) and a block the node
+			// just verified into the shared backing (missing fault) resolve by
+			// mapping the shared page-cache page into this sandbox's MAP_PRIVATE
+			// mapping. UFFDIO_CONTINUE installs it read-only; the first guest
+			// write copies-on-write privately, never disturbing the shared base.
+			// No per-sandbox private copy of an absent page is ever installed.
 			request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
-				log.Warningf("Casimir resident-page continuation failed: %v", errno)
+				log.Warningf("Casimir shared-backing continuation failed: %v", errno)
 				return
 			}
 			continue
@@ -231,15 +232,7 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 			}
 			continue
 		}
-		if uint64(len(response.Data)) != pageSize {
-			log.Warningf("Casimir verified-page response length %d, want %d", len(response.Data), pageSize)
-			return
-		}
-		copy := uffdioCopyRequest{Dst: pageStart, Src: uint64(uintptr(unsafe.Pointer(&response.Data[0]))), Len: pageSize}
-		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioCopy, uintptr(unsafe.Pointer(&copy))); errno != 0 {
-			log.Warningf("Casimir verified-page installation failed: %v", errno)
-			return
-		}
-		runtime.KeepAlive(response.Data)
+		log.Warningf("Casimir fault response resolved neither continue nor zero at %#x (mode=%s)", address, mode)
+		return
 	}
 }
