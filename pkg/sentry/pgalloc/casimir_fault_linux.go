@@ -5,6 +5,7 @@ package pgalloc
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"unsafe"
@@ -203,9 +204,11 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 		}
 		var response casimirFaultResponse
 		if err := json.NewDecoder(rw).Decode(&response); err != nil || response.Error != "" {
+			os.WriteFile("/tmp/casimir-crumb", []byte(fmt.Sprintf("REJECTED offset=%#x err=%q decode=%v\n", offset, response.Error, err)), 0644)
 			log.Warningf("Casimir fault rejected: response=%q err=%v", response.Error, err)
 			return
 		}
+		os.WriteFile("/tmp/casimir-crumb", []byte(fmt.Sprintf("RESP offset=%#x continue=%v zero=%v datalen=%d\n", offset, response.Continue, response.Zero, len(response.Data))), 0644)
 		pageStart := address &^ (pageSize - 1)
 		if response.Continue {
 			// COW-6a: both a resident block (minor fault) and a block the node
@@ -216,10 +219,11 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 			// No per-sandbox private copy of an absent page is ever installed.
 			request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
+				os.WriteFile("/tmp/casimir-crumb", []byte(fmt.Sprintf("CONTINUE-FAIL offset=%#x errno=%v mapped=%d\n", offset, errno, request.Mapped)), 0644)
 				log.Warningf("Casimir shared-backing continuation failed at %#x: %v", offset, errno)
 				return
 			}
-			log.Infof("Casimir continued %#x mapped=%d", offset, request.Mapped)
+			os.WriteFile("/tmp/casimir-crumb-ok", []byte(fmt.Sprintf("CONTINUE-OK offset=%#x mapped=%d\n", offset, request.Mapped)), 0644)
 			continue
 		}
 		if mode != "missing" {
