@@ -5,6 +5,7 @@ package pgalloc
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -65,6 +66,33 @@ type casimirFaultWakeup interface {
 	continueFault(pageStart, pageSize uint64) error
 	zeroFault(pageStart, pageSize uint64) error
 	copyFault(pageStart, pageSize uint64, data []byte) error
+}
+
+type casimirFaultSyscalls interface {
+	userfaultfd(flags uintptr) (uintptr, error)
+	ioctl(fd uintptr, request uintptr, arg uintptr) error
+	close(fd int) error
+}
+
+type linuxCasimirFaultSyscalls struct{}
+
+func (linuxCasimirFaultSyscalls) userfaultfd(flags uintptr) (uintptr, error) {
+	fd, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, flags, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return fd, nil
+}
+
+func (linuxCasimirFaultSyscalls) ioctl(fd uintptr, request uintptr, arg uintptr) error {
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, request, arg); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (linuxCasimirFaultSyscalls) close(fd int) error {
+	return unix.Close(fd)
 }
 
 type userfaultfdWakeup int
@@ -203,41 +231,52 @@ func mapCasimirFaultAlias(base *os.File, length uint64) (uintptr, error) {
 }
 
 func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
-	fd, _, errno := unix.Syscall(unix.SYS_USERFAULTFD, uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK|uffdUserModeOnly), 0, 0)
-	if errno != 0 {
-		return errno
+	return startCasimirFaultsWithSyscalls(dataFile, start, length, linuxCasimirFaultSyscalls{})
+}
+
+func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls) error {
+	const flags = uintptr(unix.O_CLOEXEC | unix.O_NONBLOCK | uffdUserModeOnly)
+	fd, err := syscalls.userfaultfd(flags)
+	if err != nil {
+		return fmt.Errorf("userfaultfd(flags=%#x): %w", flags, err)
 	}
 	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem | uffdFeatureMinorShmem}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); errno != 0 {
-		unix.Close(int(fd))
-		return errno
+	if err := syscalls.ioctl(fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); err != nil {
+		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_API: %w", err))
 	}
 	if api.Features&uffdFeatureMissingShmem == 0 || api.Features&uffdFeatureMinorShmem == 0 {
-		unix.Close(int(fd))
-		return unix.ENOTSUP
+		return closeCasimirFaultFD(
+			syscalls,
+			fd,
+			fmt.Errorf("ioctl UFFDIO_API missing shmem features %#x: %w", api.Features, unix.ENOTSUP),
+		)
 	}
 	registration := uffdioRegisterRequest{
 		Range: uffdioRange{Start: uint64(start), Len: length},
 		Mode:  uffdioRegisterMissing | uffdioRegisterMinor,
 	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); errno != 0 {
-		unix.Close(int(fd))
-		return errno
+	if err := syscalls.ioctl(fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); err != nil {
+		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_REGISTER: %w", err))
 	}
 	conn, err := net.FileConn(dataFile)
 	dataFile.Close()
 	if err != nil {
-		unix.Close(int(fd))
-		return err
+		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("open Casimir data connection: %w", err))
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	if err := consumeCasimirMappings(rw, length); err != nil {
 		conn.Close()
-		unix.Close(int(fd))
-		return err
+		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("consume Casimir mappings: %w", err))
 	}
 	go serveCasimirFaults(int(fd), conn, rw, uint64(start), length)
 	return nil
+}
+
+func closeCasimirFaultFD(syscalls casimirFaultSyscalls, fd uintptr, cause error) error {
+	if err := syscalls.close(int(fd)); err != nil {
+		return errors.Join(cause, fmt.Errorf("close Casimir userfaultfd: %w", err))
+	}
+	return cause
 }
 
 // consumeCasimirMappings consumes the complete signed layout region table
