@@ -88,16 +88,16 @@ func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
 	if errno != 0 {
 		return errno
 	}
-	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem}
+	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem | uffdFeatureMinorShmem}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); errno != 0 {
 		unix.Close(int(fd))
 		return errno
 	}
-	if api.Features&uffdFeatureMissingShmem == 0 {
+	if api.Features&uffdFeatureMissingShmem == 0 || api.Features&uffdFeatureMinorShmem == 0 {
 		unix.Close(int(fd))
 		return unix.ENOTSUP
 	}
-	registration := uffdioRegisterRequest{Range: uffdioRange{Start: uint64(start), Len: length}, Mode: uffdioRegisterMissing}
+	registration := uffdioRegisterRequest{Range: uffdioRange{Start: uint64(start), Len: length}, Mode: uffdioRegisterMissing | uffdioRegisterMinor}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); errno != 0 {
 		unix.Close(int(fd))
 		return errno
