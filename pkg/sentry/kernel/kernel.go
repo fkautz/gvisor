@@ -693,7 +693,7 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
 // pagesMetadata, and pagesFile, even if it returns a non-nil error.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, baseFile *os.File, appMFExcludeCommittedZeroPages, resume bool) error {
 	if hostarch.PageSize != 4096 {
 		return fmt.Errorf("save is not supported with %dK page size", hostarch.PageSize/1024)
 	}
@@ -742,7 +742,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 			mfSaveWg.Add(1)
 			go func() {
 				defer mfSaveWg.Done()
-				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
+				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, baseFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
 			}()
 			pagesCleanup.Release()
 			// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -796,7 +796,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 				return mfSaveErr
 			}
 		} else {
-			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSave, appMFExcludeCommittedZeroPages)
+			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, baseFile, mfsToSave, appMFExcludeCommittedZeroPages)
 			if mfSaveErr != nil {
 				return mfSaveErr
 			}
@@ -825,7 +825,7 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 // pagesFile must be non-nil, saveMemoryFiles takes ownership of both
 // pagesMetadata and pagesFile (even if it returns a non-nil error), and
 // MemoryFile state will be saved to pagesMetadata and pagesFile.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, baseFile *os.File, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
 	memoryStart := time.Now()
 
 	pmw := w
@@ -861,9 +861,22 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 		mfOpts.PagesFile = apfs
 	}
 
+	// GVISOR-3 (C1b): export the main MemoryFile's shared base and save only the
+	// delta against it. Applies to the MAIN MemoryFile only; cleared before the
+	// private MemoryFiles (which have no base).
+	if baseFile != nil {
+		baseBytes, err := k.mf.ExportLinearBase(baseFile)
+		if err != nil {
+			return fmt.Errorf("exporting shared base: %w", err)
+		}
+		mfOpts.SharedBaseFile = baseFile
+		mfOpts.SharedBaseBytes = baseBytes
+	}
 	if err := k.mf.SaveTo(ctx, pmw, &mfOpts); err != nil {
 		return err
 	}
+	mfOpts.SharedBaseFile = nil
+	mfOpts.SharedBaseBytes = 0
 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
 	// usage behavior, but not necessarily usage of private MemoryFiles.
 	mfOpts.ExcludeCommittedZeroPages = false

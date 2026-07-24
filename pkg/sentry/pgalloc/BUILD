@@ -207,10 +207,16 @@ go_test(
     srcs = [
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
+        "sharedbase_test.go",
+        "saverestore_test.go",
+        "flatten_test.go",
     ],
     library = ":pgalloc",
     deps = [
+        "//pkg/context",
         "//pkg/hostarch",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/state/stateio",
+        "//pkg/state",
     ],
 )

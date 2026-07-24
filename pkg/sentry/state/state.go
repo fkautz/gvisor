@@ -18,6 +18,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"os"
 	"io"
 	"time"
 
@@ -53,6 +54,11 @@ type SaveOpts struct {
 	// PagesFile is the file in which all MemoryFile pages are stored if
 	// PagesFile is non-nil. Otherwise this content is stored in Destination.
 	PagesFile stateio.AsyncWriter
+
+	// SharedBaseFile, if non-nil, is the base.img output: k.SaveTo exports the
+	// main MemoryFile's shared base into it and saves a delta-only checkpoint
+	// against it (GVISOR-3 C1b).
+	SharedBaseFile *os.File
 
 	// Key is used to enable state integrity check.
 	Key []byte
@@ -157,9 +163,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.SharedBaseFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
+		opts.SharedBaseFile = nil
 	}
 
 	t1, _ := CPUTime()

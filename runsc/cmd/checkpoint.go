@@ -40,6 +40,7 @@ type Checkpoint struct {
 	excludeCommittedZeroPages bool
 	cudaCheckpointPath        string
 	cudaCheckpointSequential  bool
+	sharedBase                bool
 	saveRestoreExecArgv       string
 	saveRestoreExecTimeout    time.Duration
 
@@ -75,6 +76,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
+	f.BoolVar(&c.sharedBase, "shared-base", false, "produce base.img and a delta-only checkpoint against it (GVISOR-3)")
 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 
@@ -121,6 +123,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
 		CudaCheckpointPath:         c.cudaCheckpointPath,
 		CudaCheckpointSequential:   c.cudaCheckpointSequential,
+		SharedBase:                 c.sharedBase,
 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,
