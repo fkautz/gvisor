@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -203,6 +204,13 @@ type MemoryFile struct {
 	// casimirFaults is nonzero when missing shared-base pages are resolved by
 	// the authenticated Casimir userfaultfd channel.
 	casimirFaults atomicbitops.Uint32 `state:"nosave"`
+
+	// casimirFaultMapping is a read-only MAP_SHARED alias of the canonical
+	// backing. userfaultfd MISSING|MINOR is registered on this alias rather
+	// than on chunks' writable MAP_PRIVATE overlay: MapInternal faults the
+	// alias first, then returns the private overlay for guest COW writes.
+	casimirFaultMapping    uintptr `state:"nosave"`
+	casimirFaultMappingLen uint64  `state:"nosave"`
 
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
@@ -565,6 +573,18 @@ func (f *MemoryFile) releaserDestroyLocked() {
 			log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)
 		}
 		chunk.mapping = 0
+	}
+	if f.casimirFaultMapping != 0 {
+		if _, _, errno := unix.Syscall(
+			unix.SYS_MUNMAP,
+			f.casimirFaultMapping,
+			uintptr(f.casimirFaultMappingLen),
+			0,
+		); errno != 0 {
+			log.Warningf("Failed to unmap Casimir shared fault alias %#x: %v", f.casimirFaultMapping, errno)
+		}
+		f.casimirFaultMapping = 0
+		f.casimirFaultMappingLen = 0
 	}
 }
 
@@ -1606,6 +1626,9 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 			return safemem.BlockSeq{}, err
 		}
 	}
+	if err := f.prefetchCasimirRange(fr); err != nil {
+		return safemem.BlockSeq{}, err
+	}
 
 	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)
 	if chunks == 1 {
@@ -1614,9 +1637,6 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		f.forEachMappingSlice(fr, func(bs []byte) {
 			seq = safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bs))
 		})
-		if err := f.prefetchCasimirMappings(seq); err != nil {
-			return safemem.BlockSeq{}, err
-		}
 		return seq, nil
 	}
 	blocks := make([]safemem.Block, 0, chunks)
@@ -1624,24 +1644,29 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		blocks = append(blocks, safemem.BlockFromSafeSlice(bs))
 	})
 	seq := safemem.BlockSeqFromSlice(blocks)
-	if err := f.prefetchCasimirMappings(seq); err != nil {
-		return safemem.BlockSeq{}, err
-	}
 	return seq, nil
 }
 
-func (f *MemoryFile) prefetchCasimirMappings(seq safemem.BlockSeq) error {
+func (f *MemoryFile) prefetchCasimirRange(fr memmap.FileRange) error {
 	if f.casimirFaults.Load() == 0 {
 		return nil
 	}
-	for !seq.IsEmpty() {
-		bytes := seq.Head().ToSlice()
-		for offset := 0; offset < len(bytes); offset += hostarch.PageSize {
-			if _, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes[offset:])); err != nil {
-				return err
-			}
+	if f.casimirFaultMapping == 0 {
+		return linuxerr.EFAULT
+	}
+	if fr.Start >= f.casimirFaultMappingLen {
+		return nil
+	}
+	end := fr.End
+	if end > f.casimirFaultMappingLen {
+		end = f.casimirFaultMappingLen
+	}
+	for offset := fr.Start; offset < end; offset += hostarch.PageSize {
+		address := f.casimirFaultMapping + uintptr(offset)
+		bytes := unsafe.Slice((*byte)(unsafe.Pointer(address)), hostarch.PageSize)
+		if _, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes)); err != nil {
+			return err
 		}
-		seq = seq.Tail()
 	}
 	return nil
 }

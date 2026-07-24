@@ -7,7 +7,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"net"
+	"os"
 	"testing"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
 type recordingCasimirWakeup struct {
@@ -15,6 +20,65 @@ type recordingCasimirWakeup struct {
 	pageStart uint64
 	pageSize  uint64
 	data      []byte
+}
+
+func TestCasimirFaultAliasIsSharedAndSeparateFromPrivateOverlay(t *testing.T) {
+	pageSize := os.Getpagesize()
+	base, err := os.CreateTemp("", "casimir-fault-alias-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	if err := base.Truncate(int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.WriteAt([]byte{0x11}, 0); err != nil {
+		t.Fatal(err)
+	}
+	private, err := unix.Mmap(
+		int(base.Fd()),
+		0,
+		pageSize,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_PRIVATE,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Munmap(private)
+	private[0] = 0x22
+
+	aliasStart, err := mapCasimirFaultAlias(base, uint64(pageSize))
+	if err != nil {
+		t.Fatalf("mapCasimirFaultAlias() error = %v", err)
+	}
+	defer unix.Syscall(unix.SYS_MUNMAP, aliasStart, uintptr(pageSize), 0)
+	alias := unsafe.Slice((*byte)(unsafe.Pointer(aliasStart)), pageSize)
+	if got := alias[0]; got != 0x11 {
+		t.Fatalf("shared alias byte = %#x, want backing byte 0x11 instead of private overlay byte 0x22", got)
+	}
+	if _, err := base.WriteAt([]byte{0x33}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := alias[0]; got != 0x33 {
+		t.Fatalf("shared alias did not observe backing publication: got %#x, want 0x33", got)
+	}
+	if got := private[0]; got != 0x22 {
+		t.Fatalf("private overlay lost COW byte: got %#x, want 0x22", got)
+	}
+}
+
+func TestCasimirPrefetchIgnoresMemoryFileTailOutsideSharedBase(t *testing.T) {
+	pageSize := uint64(os.Getpagesize())
+	mf := &MemoryFile{
+		casimirFaultMapping:    1,
+		casimirFaultMappingLen: pageSize,
+	}
+	mf.casimirFaults.Store(1)
+	if err := mf.prefetchCasimirRange(memmap.FileRange{Start: pageSize, End: 2 * pageSize}); err != nil {
+		t.Fatalf("prefetchCasimirRange(non-base tail) error = %v", err)
+	}
 }
 
 func (w *recordingCasimirWakeup) continueFault(pageStart, pageSize uint64) error {
@@ -56,6 +120,14 @@ func TestResolveCasimirFaultUsesExplicitActionAsSoleWakeupAuthority(t *testing.T
 		{
 			name: "continue",
 			mode: "minor",
+			response: casimirFaultResponse{
+				FaultAction: "continue",
+			},
+			want: "continue",
+		},
+		{
+			name: "continue after missing publication",
+			mode: "missing",
 			response: casimirFaultResponse{
 				FaultAction: "continue",
 			},
@@ -112,7 +184,6 @@ func TestResolveCasimirFaultRejectsWithoutWakeup(t *testing.T) {
 		{name: "copy without data", mode: "missing", response: casimirFaultResponse{FaultAction: "copy"}},
 		{name: "copy short data", mode: "missing", response: casimirFaultResponse{FaultAction: "copy", Data: page[:4095]}},
 		{name: "copy for minor", mode: "minor", response: casimirFaultResponse{FaultAction: "copy", Data: page}},
-		{name: "continue for missing", mode: "missing", response: casimirFaultResponse{FaultAction: "continue", Continue: true}},
 		{name: "continue with error", mode: "minor", response: casimirFaultResponse{FaultAction: "continue", Error: "verification failed"}},
 		{name: "continue with fatal", mode: "minor", response: casimirFaultResponse{FaultAction: "continue", Fatal: true}},
 		{name: "continue with data", mode: "minor", response: casimirFaultResponse{FaultAction: "continue", Continue: true, Data: page}},
