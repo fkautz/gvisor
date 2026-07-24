@@ -5,6 +5,7 @@ package pgalloc
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
@@ -60,6 +61,39 @@ type uffdioContinueRequest struct {
 	Mapped int64
 }
 
+type casimirFaultWakeup interface {
+	continueFault(pageStart, pageSize uint64) error
+	zeroFault(pageStart, pageSize uint64) error
+	copyFault(pageStart, pageSize uint64, data []byte) error
+}
+
+type userfaultfdWakeup int
+
+func (u userfaultfdWakeup) continueFault(pageStart, pageSize uint64) error {
+	request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (u userfaultfdWakeup) zeroFault(pageStart, pageSize uint64) error {
+	request := uffdioZeropageRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioZeropage, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (u userfaultfdWakeup) copyFault(pageStart, pageSize uint64, data []byte) error {
+	request := uffdioCopyRequest{Dst: pageStart, Src: uint64(uintptr(unsafe.Pointer(&data[0]))), Len: pageSize}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioCopy, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		return errno
+	}
+	runtime.KeepAlive(data)
+	return nil
+}
+
 type casimirFaultRequest struct {
 	Operation string `json:"operation"`
 	FaultMode string `json:"fault_mode,omitempty"`
@@ -76,11 +110,77 @@ type casimirRegion struct {
 }
 
 type casimirFaultResponse struct {
-	Error    string          `json:"error,omitempty"`
-	Zero     bool            `json:"zero,omitempty"`
-	Continue bool            `json:"continue,omitempty"`
-	Data     []byte          `json:"data,omitempty"`
-	Regions  []casimirRegion `json:"regions,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	Zero        bool            `json:"zero,omitempty"`
+	Continue    bool            `json:"continue,omitempty"`
+	Fatal       bool            `json:"fatal,omitempty"`
+	FaultAction string          `json:"fault_action"`
+	Data        []byte          `json:"data,omitempty"`
+	Regions     []casimirRegion `json:"regions,omitempty"`
+}
+
+func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pageSize uint64) (string, error) {
+	reject := func(reason string) (string, error) {
+		return "", fmt.Errorf("reject Casimir fault response: %s: %w", reason, unix.EINVAL)
+	}
+	switch response.FaultAction {
+	case "copy":
+		if mode != "missing" || response.Error != "" || response.Fatal || response.Zero || response.Continue ||
+			uint64(len(response.Data)) != pageSize {
+			return reject("invalid copy action")
+		}
+	case "continue":
+		if mode != "minor" || response.Error != "" || response.Fatal || response.Zero || len(response.Data) != 0 {
+			return reject("invalid continue action")
+		}
+	case "zero":
+		if mode != "missing" || response.Error != "" || response.Fatal || response.Continue || len(response.Data) != 0 {
+			return reject("invalid zero action")
+		}
+	case "fatal":
+		if response.Error == "" || !response.Fatal || response.Zero || response.Continue || len(response.Data) != 0 {
+			return reject("invalid fatal action")
+		}
+		return reject("fatal action: " + response.Error)
+	default:
+		return reject("missing or unknown action")
+	}
+	return response.FaultAction, nil
+}
+
+func resolveCasimirFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode string, offset, address, pageSize uint64) error {
+	if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", FaultMode: mode, Offset: offset, Length: pageSize}); err != nil {
+		return fmt.Errorf("encode Casimir fault request: %w", err)
+	}
+	if err := rw.Flush(); err != nil {
+		return fmt.Errorf("flush Casimir fault request: %w", err)
+	}
+	var response casimirFaultResponse
+	if err := json.NewDecoder(rw).Decode(&response); err != nil {
+		return fmt.Errorf("decode Casimir fault response: %w", err)
+	}
+	action, err := validateCasimirFaultResponse(response, mode, pageSize)
+	if err != nil {
+		return err
+	}
+	pageStart := address &^ (pageSize - 1)
+	switch action {
+	case "continue":
+		if err := wakeup.continueFault(pageStart, pageSize); err != nil {
+			return fmt.Errorf("continue Casimir resident page: %w", err)
+		}
+	case "zero":
+		if err := wakeup.zeroFault(pageStart, pageSize); err != nil {
+			return fmt.Errorf("install Casimir verified zero: %w", err)
+		}
+	case "copy":
+		if err := wakeup.copyFault(pageStart, pageSize, response.Data); err != nil {
+			return fmt.Errorf("install Casimir verified page: %w", err)
+		}
+	default:
+		return fmt.Errorf("unhandled Casimir fault action %q: %w", action, unix.EINVAL)
+	}
+	return nil
 }
 
 func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
@@ -193,53 +293,9 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 		if flags&uffdPagefaultFlagMinor != 0 {
 			mode = "minor"
 		}
-		if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", FaultMode: mode, Offset: offset, Length: pageSize}); err != nil {
-			log.Warningf("Casimir fault request failed: %v", err)
+		if err := resolveCasimirFault(rw, userfaultfdWakeup(uffd), mode, offset, address, pageSize); err != nil {
+			log.Warningf("Casimir fault resolution failed: %v", err)
 			return
 		}
-		if err := rw.Flush(); err != nil {
-			log.Warningf("Casimir fault request flush failed: %v", err)
-			return
-		}
-		var response casimirFaultResponse
-		if err := json.NewDecoder(rw).Decode(&response); err != nil || response.Error != "" {
-			log.Warningf("Casimir fault rejected: response=%q err=%v", response.Error, err)
-			return
-		}
-		pageStart := address &^ (pageSize - 1)
-		if response.Continue {
-			if mode != "minor" {
-				log.Warningf("Casimir continuation for non-minor fault at %#x", address)
-				return
-			}
-			request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
-			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
-				log.Warningf("Casimir resident-page continuation failed: %v", errno)
-				return
-			}
-			continue
-		}
-		if mode != "missing" {
-			log.Warningf("Casimir non-continuation response for minor fault at %#x", address)
-			return
-		}
-		if response.Zero {
-			zero := uffdioZeropageRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
-			if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioZeropage, uintptr(unsafe.Pointer(&zero))); errno != 0 {
-				log.Warningf("Casimir verified-zero installation failed: %v", errno)
-				return
-			}
-			continue
-		}
-		if uint64(len(response.Data)) != pageSize {
-			log.Warningf("Casimir verified-page response length %d, want %d", len(response.Data), pageSize)
-			return
-		}
-		copy := uffdioCopyRequest{Dst: pageStart, Src: uint64(uintptr(unsafe.Pointer(&response.Data[0]))), Len: pageSize}
-		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffd), uffdioCopy, uintptr(unsafe.Pointer(&copy))); errno != 0 {
-			log.Warningf("Casimir verified-page installation failed: %v", errno)
-			return
-		}
-		runtime.KeepAlive(response.Data)
 	}
 }

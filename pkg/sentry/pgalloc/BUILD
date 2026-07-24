@@ -206,6 +206,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "casimir_fault_linux_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "sharedbase_test.go",
