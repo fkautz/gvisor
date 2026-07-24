@@ -24,12 +24,18 @@ import (
 
 const (
 	// These ioctl request numbers are defined by linux/userfaultfd.h. Casimir's
-	// verified shared-base handler needs only negotiation, missing-page
-	// registration, wake, and verified zero installation.
+	// verified shared-base handler needs only negotiation, missing/minor
+	// registration, resident continuation, verified copy, and verified zero
+	// installation.
 	uffdioAPI      = 0xc018aa3f
 	uffdioRegister = 0xc020aa00
 	uffdioCopy     = 0xc028aa03
 	uffdioZeropage = 0xc020aa04
+	uffdioContinue = 0xc020aa07
+
+	// UFFD_USER_MODE_ONLY is 1. Keep the userfaultfd syscall rule restricted
+	// to the exact nonblocking, close-on-exec mode used by pgalloc.
+	casimirUserfaultfdFlags = unix.O_CLOEXEC | unix.O_NONBLOCK | 1
 )
 
 // SeccompInfo returns seccomp information for the KVM platform.
@@ -42,6 +48,7 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
 				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioRegister)},
 				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioCopy)},
 				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioZeropage)},
+				seccomp.PerArg{seccomp.NonNegativeFD{}, seccomp.EqualTo(uffdioContinue)},
 				seccomp.PerArg{
 					seccomp.NonNegativeFD{},
 					seccomp.EqualTo(KVM_RUN),
@@ -67,7 +74,10 @@ func (k *KVM) SeccompInfo() platform.SeccompInfo {
 				seccomp.EqualTo(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED),
 				seccomp.EqualTo(0),
 			},
-			unix.SYS_MMAP:            seccomp.MatchAll{},
+			unix.SYS_MMAP: seccomp.MatchAll{},
+			unix.SYS_USERFAULTFD: seccomp.PerArg{
+				seccomp.EqualTo(casimirUserfaultfdFlags),
+			},
 			unix.SYS_RT_SIGSUSPEND:   seccomp.MatchAll{},
 			unix.SYS_RT_SIGTIMEDWAIT: seccomp.MatchAll{},
 			_SYS_KVM_RETURN_TO_HOST:  seccomp.MatchAll{},

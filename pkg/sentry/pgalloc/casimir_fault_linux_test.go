@@ -6,8 +6,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -20,6 +22,110 @@ type recordingCasimirWakeup struct {
 	pageStart uint64
 	pageSize  uint64
 	data      []byte
+}
+
+type recordingCasimirFaultSyscalls struct {
+	openErr       error
+	failRequest   uintptr
+	openedFlags   uintptr
+	ioctlRequests []uintptr
+	closedFDs     []int
+}
+
+func (s *recordingCasimirFaultSyscalls) userfaultfd(flags uintptr) (uintptr, error) {
+	s.openedFlags = flags
+	if s.openErr != nil {
+		return 0, s.openErr
+	}
+	return 42, nil
+}
+
+func (s *recordingCasimirFaultSyscalls) ioctl(_ uintptr, request uintptr, arg uintptr) error {
+	s.ioctlRequests = append(s.ioctlRequests, request)
+	if request == uffdioAPI {
+		api := (*uffdioAPIRequest)(unsafe.Pointer(arg))
+		api.Features |= uffdFeatureMissingShmem | uffdFeatureMinorShmem
+	}
+	if request == s.failRequest {
+		return unix.EPERM
+	}
+	return nil
+}
+
+func (s *recordingCasimirFaultSyscalls) close(fd int) error {
+	s.closedFDs = append(s.closedFDs, fd)
+	return nil
+}
+
+func TestStartCasimirFaultsLabelsEPERMBoundaryAndClosesOpenedFD(t *testing.T) {
+	tests := []struct {
+		name         string
+		syscalls     *recordingCasimirFaultSyscalls
+		wantBoundary string
+		wantRequests []uintptr
+		wantClosed   []int
+	}{
+		{
+			name:         "userfaultfd syscall",
+			syscalls:     &recordingCasimirFaultSyscalls{openErr: unix.EPERM},
+			wantBoundary: "userfaultfd",
+		},
+		{
+			name:         "UFFDIO_API ioctl",
+			syscalls:     &recordingCasimirFaultSyscalls{failRequest: uffdioAPI},
+			wantBoundary: "UFFDIO_API",
+			wantRequests: []uintptr{uffdioAPI},
+			wantClosed:   []int{42},
+		},
+		{
+			name:         "UFFDIO_REGISTER ioctl",
+			syscalls:     &recordingCasimirFaultSyscalls{failRequest: uffdioRegister},
+			wantBoundary: "UFFDIO_REGISTER",
+			wantRequests: []uintptr{uffdioAPI, uffdioRegister},
+			wantClosed:   []int{42},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := startCasimirFaultsWithSyscalls(nil, 0x1000, 4096, test.syscalls)
+			if !errors.Is(err, unix.EPERM) || !strings.Contains(err.Error(), test.wantBoundary) {
+				t.Fatalf("startCasimirFaultsWithSyscalls() error = %v, want EPERM at %s", err, test.wantBoundary)
+			}
+			if got, want := test.syscalls.openedFlags, uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK|uffdUserModeOnly); got != want {
+				t.Fatalf("userfaultfd flags = %#x, want %#x", got, want)
+			}
+			if !equalUintptrs(test.syscalls.ioctlRequests, test.wantRequests) {
+				t.Fatalf("ioctl requests = %#x, want %#x", test.syscalls.ioctlRequests, test.wantRequests)
+			}
+			if !equalInts(test.syscalls.closedFDs, test.wantClosed) {
+				t.Fatalf("closed FDs = %v, want %v", test.syscalls.closedFDs, test.wantClosed)
+			}
+		})
+	}
+}
+
+func equalUintptrs(left, right []uintptr) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalInts(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCasimirFaultAliasIsSharedAndSeparateFromPrivateOverlay(t *testing.T) {

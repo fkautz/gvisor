@@ -106,6 +106,7 @@ go_library(
 go_test(
     name = "kvm_test",
     srcs = [
+        "filters_test.go",
         "kvm_amd64_test.go",
         "kvm_amd64_test.s",
         "kvm_arm64_test.go",
@@ -131,6 +132,8 @@ go_test(
         "//pkg/ring0",
         "//pkg/ring0/pagetables",
         "//pkg/safecopy",
+        "//pkg/seccomp",
+        "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/arch/fpu",
         "//pkg/sentry/platform",
