@@ -21,6 +21,7 @@ implementations of the control interface.
 package server
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,13 +38,35 @@ import (
 // curUID is the unix user ID of the user that the control server is running as.
 var curUID = os.Getuid()
 
+type serverSocket interface {
+	FD() int
+	Listen() error
+	Accept() (*unet.Socket, error)
+	Close() error
+}
+
+type serveError struct {
+	err error
+}
+
 // Server is a basic control server.
 type Server struct {
 	// socket is our bound socket.
-	socket *unet.ServerSocket
+	socket serverSocket
 
 	// server is our rpc server.
 	server atomic.Pointer[urpc.Server]
+
+	// stopping is set before Stop closes the listening socket.
+	stopping atomic.Bool
+
+	// serveErr records an unexpected accept-loop exit before the serving
+	// goroutine fails closed.
+	serveErr atomic.Pointer[serveError]
+
+	// fatalExit terminates the sandbox after an unexpected accept-loop exit.
+	// Tests replace this callback to observe the fail-closed boundary.
+	fatalExit func(error)
 
 	// wg waits for the accept loop to terminate.
 	wg sync.WaitGroup
@@ -52,7 +75,8 @@ type Server struct {
 // New returns a new bound control server.
 func New(socket *unet.ServerSocket) *Server {
 	s := &Server{
-		socket: socket,
+		socket:    socket,
+		fatalExit: func(err error) { panic(err) },
 	}
 	s.server.Store(urpc.NewServer())
 	return s
@@ -77,9 +101,19 @@ func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
+// ServeError returns the exact unexpected error that terminated the accept
+// loop, if any. Callers that require a stable result must call Wait first.
+func (s *Server) ServeError() error {
+	if err := s.serveErr.Load(); err != nil {
+		return err.err
+	}
+	return nil
+}
+
 // Stop stops the server. Note that this function should only be called once
 // and the server should not be used afterwards.
 func (s *Server) Stop(timeout time.Duration) {
+	s.stopping.Store(true)
 	s.socket.Close()
 	s.Wait()
 
@@ -97,28 +131,48 @@ func (s *Server) StartServing() error {
 		return err
 	}
 
+	ready := make(chan struct{})
 	s.wg.Add(1)
 	go func() { // S/R-SAFE: does not impact state directly.
-		s.serve()
-		s.wg.Done()
+		defer s.wg.Done()
+		close(ready)
+		if err := s.serve(); err != nil {
+			s.fatalExit(err)
+		}
 	}()
+	<-ready
 
 	return nil
 }
 
 // serve is the body of the main service goroutine. It handles incoming control
 // connections and dispatches requests to registered objects.
-func (s *Server) serve() {
+func (s *Server) serve() error {
 	for {
 		// Accept clients.
 		conn, err := s.socket.Accept()
 		if err != nil {
-			return
+			if s.stopping.Load() && errors.Is(err, unix.EBADF) {
+				return nil
+			}
+			if retryableAcceptError(err) {
+				continue
+			}
+			err = fmt.Errorf("control server accept loop terminated: %w", err)
+			s.serveErr.Store(&serveError{err: err})
+			return err
 		}
 
 		// Handle the connection non-blockingly.
 		s.server.Load().StartHandling(conn)
 	}
+}
+
+// retryableAcceptError is deliberately limited to interruption and an
+// aborted pending connection. Other errors terminate the sandbox rather than
+// silently removing its control plane.
+func retryableAcceptError(err error) bool {
+	return errors.Is(err, unix.EINTR) || errors.Is(err, unix.ECONNABORTED)
 }
 
 // Register registers a specific control interface with the server.
