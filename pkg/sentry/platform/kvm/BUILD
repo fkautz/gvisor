@@ -104,9 +104,21 @@ go_library(
 )
 
 go_test(
+    name = "filters_test",
+    srcs = ["filters_test.go"],
+    library = ":kvm",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/bpf",
+        "//pkg/seccomp",
+        "//pkg/seccomp/precompiledseccomp",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
     name = "kvm_test",
     srcs = [
-        "filters_test.go",
         "kvm_amd64_test.go",
         "kvm_amd64_test.s",
         "kvm_arm64_test.go",

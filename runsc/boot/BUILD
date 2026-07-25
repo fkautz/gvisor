@@ -33,6 +33,7 @@ go_library(
         "//runsc:__subpackages__",
         "//test:__subpackages__",
     ],
+    embed = [":casimir_restore"],
     deps = [
         "//pkg/abi",
         "//pkg/abi/linux",
@@ -157,6 +158,13 @@ go_library(
     ],
 )
 
+go_library(
+    name = "casimir_restore",
+    srcs = ["casimir_restore.go"],
+    stateify = False,
+    deps = ["//pkg/urpc"],
+)
+
 go_test(
     name = "boot_test",
     size = "small",
@@ -189,4 +197,12 @@ go_test(
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "casimir_restore_test",
+    size = "small",
+    srcs = ["casimir_restore_test.go"],
+    embed = [":casimir_restore"],
+    deps = ["//pkg/urpc"],
 )

@@ -206,7 +206,6 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
-        "casimir_fault_linux_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "sharedbase_test.go",
@@ -220,5 +219,16 @@ go_test(
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/stateio",
         "//pkg/state",
+    ],
+)
+
+go_test(
+    name = "casimir_fault_test",
+    size = "small",
+    srcs = ["casimir_fault_linux_test.go"],
+    library = ":pgalloc",
+    deps = [
+        "//pkg/sentry/memmap",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
