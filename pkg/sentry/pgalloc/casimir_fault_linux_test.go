@@ -5,8 +5,10 @@ package pgalloc
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -173,6 +175,172 @@ func TestCasimirFaultAliasIsSharedAndSeparateFromPrivateOverlay(t *testing.T) {
 	if got := private[0]; got != 0x22 {
 		t.Fatalf("private overlay lost COW byte: got %#x, want 0x22", got)
 	}
+}
+
+func TestCasimirFaultAliasOneShotRetiresWritableCapability(t *testing.T) {
+	pageSize := os.Getpagesize()
+	base, err := os.CreateTemp("", "casimir-fault-one-shot-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	if err := base.Truncate(int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.WriteAt([]byte("canonical"), 0); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := os.Open(base.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if err := verifyCasimirFaultBaseIdentity(readOnly, base); err != nil {
+		t.Fatalf("verify one-shot fault base: %v", err)
+	}
+	before := hashFileAt(t, readOnly, pageSize)
+
+	aliasStart, err := mapCasimirFaultAliasOneShot(base, uint64(pageSize))
+	if err != nil {
+		t.Fatalf("map one-shot fault alias: %v", err)
+	}
+	defer unix.Syscall(unix.SYS_MUNMAP, aliasStart, uintptr(pageSize), 0)
+	if _, err := base.Stat(); err == nil {
+		t.Fatal("one-shot writable base descriptor remained open after mmap")
+	}
+	if perms := mappingPermissions(t, aliasStart); perms != "r--s" {
+		t.Fatalf("fault alias permissions = %q, want read-only shared r--s", perms)
+	}
+	after := hashFileAt(t, readOnly, pageSize)
+	if before != after {
+		t.Fatalf("read-only shared alias changed canonical backing bytes")
+	}
+}
+
+func TestCasimirFaultBaseCapabilitiesFailClosed(t *testing.T) {
+	left, err := os.CreateTemp("", "casimir-fault-left-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(left.Name())
+	defer left.Close()
+	right, err := os.CreateTemp("", "casimir-fault-right-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(right.Name())
+	defer right.Close()
+
+	if err := verifyCasimirFaultBaseIdentity(left, right); err == nil {
+		t.Fatal("different base files were accepted as one identity")
+	}
+	readOnly, err := os.Open(left.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if err := verifyCasimirFaultBaseIdentity(readOnly, readOnly); err == nil {
+		t.Fatal("read-only descriptor was accepted as writable one-shot capability")
+	}
+}
+
+func TestCasimirFaultAliasVMAMayWriteRegistration(t *testing.T) {
+	pageSize := os.Getpagesize()
+	rawFD, err := unix.MemfdCreate("casimir-vm-maywrite", unix.MFD_CLOEXEC)
+	if err != nil {
+		t.Skipf("memfd unavailable: %v", err)
+	}
+	base := os.NewFile(uintptr(rawFD), "casimir-vm-maywrite")
+	defer base.Close()
+	if err := base.Truncate(int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	fdPath := fmt.Sprintf("/proc/self/fd/%d", rawFD)
+	readOnlyFD, err := unix.Open(fdPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readOnly := os.NewFile(uintptr(readOnlyFD), "casimir-vm-maywrite-ro")
+	defer readOnly.Close()
+	readWriteFD, err := unix.Open(fdPath, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readWrite := os.NewFile(uintptr(readWriteFD), "casimir-vm-maywrite-rw")
+	defer readWrite.Close()
+
+	readOnlyStart, err := mapCasimirFaultAlias(readOnly, uint64(pageSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Syscall(unix.SYS_MUNMAP, readOnlyStart, uintptr(pageSize), 0)
+	if err := registerKernelCasimirFaultRange(readOnlyStart, uint64(pageSize)); err == nil || !errors.Is(err, unix.EPERM) {
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.ENOTSUP) {
+			t.Skipf("kernel userfaultfd shmem-minor support unavailable: %v", err)
+		}
+		t.Fatalf("O_RDONLY PROT_READ|MAP_SHARED registration error = %v, want EPERM", err)
+	}
+
+	readWriteStart, err := mapCasimirFaultAlias(readWrite, uint64(pageSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Syscall(unix.SYS_MUNMAP, readWriteStart, uintptr(pageSize), 0)
+	if perms := mappingPermissions(t, readWriteStart); perms != "r--s" {
+		t.Fatalf("corrected fault alias permissions = %q, want r--s", perms)
+	}
+	if err := registerKernelCasimirFaultRange(readWriteStart, uint64(pageSize)); err != nil {
+		t.Fatalf("O_RDWR PROT_READ|MAP_SHARED registration: %v", err)
+	}
+}
+
+func registerKernelCasimirFaultRange(start uintptr, length uint64) error {
+	syscalls := linuxCasimirFaultSyscalls{}
+	fd, err := syscalls.userfaultfd(uintptr(unix.O_CLOEXEC | unix.O_NONBLOCK | uffdUserModeOnly))
+	if err != nil {
+		return err
+	}
+	defer syscalls.close(int(fd))
+	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem | uffdFeatureMinorShmem}
+	if err := syscalls.ioctl(fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); err != nil {
+		return err
+	}
+	if api.Features&uffdFeatureMissingShmem == 0 || api.Features&uffdFeatureMinorShmem == 0 {
+		return unix.ENOTSUP
+	}
+	registration := uffdioRegisterRequest{
+		Range: uffdioRange{Start: uint64(start), Len: length},
+		Mode:  uffdioRegisterMissing | uffdioRegisterMinor,
+	}
+	return syscalls.ioctl(fd, uffdioRegister, uintptr(unsafe.Pointer(&registration)))
+}
+
+func mappingPermissions(t *testing.T, address uintptr) string {
+	t.Helper()
+	maps, err := os.ReadFile("/proc/self/maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(maps), "\n") {
+		var start, end uintptr
+		var permissions string
+		if _, err := fmt.Sscanf(line, "%x-%x %4s", &start, &end, &permissions); err == nil &&
+			address >= start && address < end {
+			return permissions
+		}
+	}
+	t.Fatalf("no mapping contains address %#x", address)
+	return ""
+}
+
+func hashFileAt(t *testing.T, file *os.File, size int) [sha256.Size]byte {
+	t.Helper()
+	buf := make([]byte, size)
+	if _, err := file.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	return sha256.Sum256(buf)
 }
 
 func TestCasimirPrefetchIgnoresMemoryFileTailOutsideSharedBase(t *testing.T) {

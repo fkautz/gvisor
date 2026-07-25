@@ -550,34 +550,6 @@ func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) erro
 	return nil
 }
 
-// RestoreOpts contains options related to restoring a container's file system.
-type RestoreOpts struct {
-	// FilePayload contains, in order:
-	// 1. checkpoint state file.
-	// 2. optional checkpoint pages metadata file.
-	// 3. optional checkpoint pages file.
-	// 4. optional platform device file.
-	urpc.FilePayload
-	HavePagesFile  bool
-	HaveDeviceFile bool
-	Background     bool
-
-	// HaveBaseFile indicates a shared base memory image is present at
-	// BaseFileIndex in FilePayload (GVISOR-3 C1); BaseFileBytes is its size.
-	HaveBaseFile         bool
-	BaseFileIndex        int
-	BaseFileBytes        uint64
-	HaveCasimirDataFile  bool
-	CasimirDataFileIndex int
-
-	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
-	// domain socket connected to a URPC server implementing
-	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
-	// RestoreOpts.HavePagesFile is unknown and must be determined by
-	// containerManager.Restore.
-	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
-}
-
 // Restore loads a container from a statefile.
 // The container's current kernel is destroyed, a restore environment is
 // created, and the kernel is recreated with the restore state file. The
@@ -605,6 +577,9 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
+	}
+	if err := validateCasimirRestoreCapabilities(o); err != nil {
+		return err
 	}
 
 	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
@@ -647,6 +622,19 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 		}
 		baseFile = os.NewFile(uintptr(bfd.Release()), "base-image")
 	}
+	var casimirFaultBaseFile *os.File
+	defer func() {
+		if casimirFaultBaseFile != nil {
+			casimirFaultBaseFile.Close()
+		}
+	}()
+	if o.HaveCasimirFaultBaseFile {
+		fbfd, err := o.ReleaseFD(o.CasimirFaultBaseFileIndex)
+		if err != nil {
+			return fmt.Errorf("releasing one-shot Casimir fault base image FD: %w", err)
+		}
+		casimirFaultBaseFile = os.NewFile(uintptr(fbfd.Release()), "casimir-fault-base-image")
+	}
 	var casimirDataFile *os.File
 	if o.HaveCasimirDataFile {
 		cfd, err := o.ReleaseFD(o.CasimirDataFileIndex)
@@ -658,7 +646,8 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, baseFile, o.BaseFileBytes, casimirDataFile, timer.Fork("PagesFileLoader")) // transfers ownership
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, baseFile, o.BaseFileBytes, casimirFaultBaseFile, casimirDataFile, timer.Fork("PagesFileLoader")) // transfers ownership
+		casimirFaultBaseFile = nil
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")

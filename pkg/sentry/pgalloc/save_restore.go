@@ -17,6 +17,7 @@ package pgalloc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -972,6 +973,10 @@ type LoadOpts struct {
 	// this prototype (see finding F8: the async loader writes to the memfd FD).
 	SharedBaseFile  *os.File
 	SharedBaseBytes uint64
+	// CasimirFaultBaseFile is a one-shot O_RDWR capability for the same
+	// canonical base. It is used only to create a PROT_READ|MAP_SHARED
+	// userfaultfd alias and is closed immediately after mmap.
+	CasimirFaultBaseFile *os.File
 	// CasimirDataFile is an inherited authenticated stream used to resolve
 	// missing shared-base pages through the node-owned page provider.
 	CasimirDataFile *os.File
@@ -979,6 +984,12 @@ type LoadOpts struct {
 
 // LoadFrom loads MemoryFile state from the given stream.
 func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) (err error) {
+	defer func() {
+		if opts.CasimirFaultBaseFile != nil {
+			err = errors.Join(err, opts.CasimirFaultBaseFile.Close())
+			opts.CasimirFaultBaseFile = nil
+		}
+	}()
 	mfTimeline := opts.Timeline.Fork(fmt.Sprintf("mf:%p", f)).Lease()
 	defer mfTimeline.End()
 
@@ -1063,7 +1074,16 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			f.opts.SharedBaseFile = opts.SharedBaseFile
 			f.opts.SharedBaseBytes = opts.SharedBaseBytes
 			if opts.CasimirDataFile != nil && hi > 0 {
-				faultMapping, err := mapCasimirFaultAlias(opts.SharedBaseFile, hi)
+				if opts.CasimirFaultBaseFile == nil {
+					return fmt.Errorf("Casimir data file requires one-shot writable fault base")
+				}
+				if err := verifyCasimirFaultBaseIdentity(opts.SharedBaseFile, opts.CasimirFaultBaseFile); err != nil {
+					opts.CasimirFaultBaseFile.Close()
+					opts.CasimirFaultBaseFile = nil
+					return err
+				}
+				faultMapping, err := mapCasimirFaultAliasOneShot(opts.CasimirFaultBaseFile, hi)
+				opts.CasimirFaultBaseFile = nil
 				if err != nil {
 					return fmt.Errorf("map Casimir shared-base fault alias: %w", err)
 				}
@@ -1074,6 +1094,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				f.casimirFaultMapping = faultMapping
 				f.casimirFaultMappingLen = hi
 				f.casimirFaults.Store(1)
+			} else if opts.CasimirFaultBaseFile != nil {
+				opts.CasimirFaultBaseFile.Close()
+				opts.CasimirFaultBaseFile = nil
+				return fmt.Errorf("one-shot writable fault base provided without Casimir data file")
 			}
 		}
 		madviseWG.Add(1)

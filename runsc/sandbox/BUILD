@@ -18,6 +18,7 @@ go_library(
         "//runsc:__subpackages__",
         "//test:__subpackages__",
     ],
+    embed = [":casimir_base"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
@@ -67,6 +68,13 @@ go_library(
     ],
 )
 
+go_library(
+    name = "casimir_base",
+    srcs = ["casimir_base.go"],
+    stateify = False,
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
+)
+
 go_test(
     name = "sandbox_test",
     size = "small",
@@ -80,4 +88,12 @@ go_test(
         "@com_github_vishvananda_netlink//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "casimir_base_test",
+    size = "small",
+    srcs = ["casimir_base_test.go"],
+    embed = [":casimir_base"],
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

@@ -230,6 +230,54 @@ func mapCasimirFaultAlias(base *os.File, length uint64) (uintptr, error) {
 	return start, nil
 }
 
+func mapCasimirFaultAliasOneShot(base *os.File, length uint64) (uintptr, error) {
+	start, mapErr := mapCasimirFaultAlias(base, length)
+	closeErr := base.Close()
+	if mapErr != nil {
+		return 0, errors.Join(mapErr, closeErr)
+	}
+	if closeErr != nil {
+		unix.Syscall(unix.SYS_MUNMAP, start, uintptr(length), 0)
+		return 0, fmt.Errorf("retire one-shot Casimir fault base: %w", closeErr)
+	}
+	return start, nil
+}
+
+func verifyCasimirFaultBaseIdentity(readOnlyBase, faultBase *os.File) error {
+	if readOnlyBase == nil || faultBase == nil {
+		return fmt.Errorf("missing Casimir base capability: %w", unix.EINVAL)
+	}
+	readOnlyFlags, err := unix.FcntlInt(readOnlyBase.Fd(), unix.F_GETFL, 0)
+	if err != nil {
+		return fmt.Errorf("inspect read-only base capability: %w", err)
+	}
+	if readOnlyFlags&unix.O_ACCMODE != unix.O_RDONLY {
+		return fmt.Errorf("long-lived base capability is not read-only: %w", unix.EPERM)
+	}
+	faultFlags, err := unix.FcntlInt(faultBase.Fd(), unix.F_GETFL, 0)
+	if err != nil {
+		return fmt.Errorf("inspect one-shot fault base capability: %w", err)
+	}
+	if faultFlags&unix.O_ACCMODE != unix.O_RDWR {
+		return fmt.Errorf("one-shot fault base capability is not read-write: %w", unix.EPERM)
+	}
+	readOnlyInfo, err := readOnlyBase.Stat()
+	if err != nil {
+		return fmt.Errorf("stat read-only base capability: %w", err)
+	}
+	faultInfo, err := faultBase.Stat()
+	if err != nil {
+		return fmt.Errorf("stat one-shot fault base capability: %w", err)
+	}
+	if !readOnlyInfo.Mode().IsRegular() ||
+		!faultInfo.Mode().IsRegular() ||
+		!os.SameFile(readOnlyInfo, faultInfo) ||
+		readOnlyInfo.Size() != faultInfo.Size() {
+		return fmt.Errorf("one-shot fault base differs from canonical base: %w", unix.EINVAL)
+	}
+	return nil
+}
+
 func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
 	return startCasimirFaultsWithSyscalls(dataFile, start, length, linuxCasimirFaultSyscalls{})
 }

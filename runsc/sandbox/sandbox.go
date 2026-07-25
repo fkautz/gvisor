@@ -641,21 +641,54 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 	// When present, the main MemoryFile is restored over it (MAP_PRIVATE overlay +
 	// delta), so clones from a delta-only checkpoint physically share the base.
 	baseFileName := path.Join(imagePath, "base.img")
-	if bf, err := os.Open(baseFileName); err == nil {
-		fi, ferr := bf.Stat()
-		if ferr != nil {
-			bf.Close()
-			return fmt.Errorf("stat base image %q: %w", baseFileName, ferr)
+	socketPath := os.Getenv("CASIMIR_DATA_SOCKET")
+	if socketPath != "" {
+		backingFD, err := exactInheritedFD("CASIMIR_CANONICAL_BACKING_FD", 3)
+		if err != nil {
+			return err
+		}
+		faultFD, err := exactInheritedFD("CASIMIR_CANONICAL_FAULT_BASE_FD", 5)
+		if err != nil {
+			return err
+		}
+		bf, identity, err := duplicateVerifiedInheritedBaseImage(backingFD, unix.O_RDONLY, nil)
+		if err != nil {
+			return fmt.Errorf("acquire inherited canonical base image: %w", err)
 		}
 		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
 		opt.HaveBaseFile = true
 		opt.BaseFileIndex = len(opt.FilePayload.Files) - 1
-		opt.BaseFileBytes = uint64(fi.Size())
-		log.Infof("Restoring main MemoryFile over shared base image %q (%d bytes)", baseFileName, fi.Size())
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("opening base image %q failed: %w", baseFileName, err)
+		opt.BaseFileBytes = uint64(identity.size)
+		faultBase, _, err := consumeVerifiedInheritedFaultBaseImage(faultFD, &identity)
+		if err != nil {
+			bf.Close()
+			opt.FilePayload.Files = opt.FilePayload.Files[:len(opt.FilePayload.Files)-1]
+			opt.HaveBaseFile = false
+			opt.BaseFileIndex = 0
+			opt.BaseFileBytes = 0
+			return fmt.Errorf("acquire one-shot inherited Casimir fault base image: %w", err)
+		}
+		opt.FilePayload.Files = append(opt.FilePayload.Files, faultBase)
+		opt.HaveCasimirFaultBaseFile = true
+		opt.CasimirFaultBaseFileIndex = len(opt.FilePayload.Files) - 1
+		log.Infof("Restoring main MemoryFile over inherited shared base image (%d bytes)", identity.size)
+	} else {
+		if bf, err := os.Open(baseFileName); err == nil {
+			fi, ferr := bf.Stat()
+			if ferr != nil {
+				bf.Close()
+				return fmt.Errorf("stat base image %q: %w", baseFileName, ferr)
+			}
+			opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
+			opt.HaveBaseFile = true
+			opt.BaseFileIndex = len(opt.FilePayload.Files) - 1
+			opt.BaseFileBytes = uint64(fi.Size())
+			log.Infof("Restoring main MemoryFile over shared base image %q (%d bytes)", baseFileName, fi.Size())
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("opening base image %q failed: %w", baseFileName, err)
+		}
 	}
-	if socketPath := os.Getenv("CASIMIR_DATA_SOCKET"); socketPath != "" {
+	if socketPath != "" {
 		conn, err := net.Dial("unix", socketPath)
 		if err != nil {
 			return fmt.Errorf("connect Casimir page provider: %w", err)
