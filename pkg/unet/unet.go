@@ -513,6 +513,8 @@ func (s *ServerSocket) Accept() (*Socket, error) {
 		switch err {
 		case nil:
 			return NewSocket(nfd)
+		case unix.EINTR:
+			continue
 		case unix.EAGAIN:
 			err = s.socket.wait(false)
 			if err == errClosing {
