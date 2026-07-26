@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -89,7 +90,7 @@ func TestStartCasimirFaultsLabelsEPERMBoundaryAndClosesOpenedFD(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := startCasimirFaultsWithSyscalls(nil, 0x1000, 4096, test.syscalls)
+			_, err := startCasimirFaultsWithSyscalls(nil, 0x1000, 4096, test.syscalls)
 			if !errors.Is(err, unix.EPERM) || !strings.Contains(err.Error(), test.wantBoundary) {
 				t.Fatalf("startCasimirFaultsWithSyscalls() error = %v, want EPERM at %s", err, test.wantBoundary)
 			}
@@ -101,6 +102,93 @@ func TestStartCasimirFaultsLabelsEPERMBoundaryAndClosesOpenedFD(t *testing.T) {
 			}
 			if !equalInts(test.syscalls.closedFDs, test.wantClosed) {
 				t.Fatalf("closed FDs = %v, want %v", test.syscalls.closedFDs, test.wantClosed)
+			}
+		})
+	}
+}
+
+func TestConsumeCasimirMappingsRetainsExactSignedAttributes(t *testing.T) {
+	response := casimirFaultResponse{Regions: []CasimirRegion{
+		{GuestStart: 0, Length: 4096, State: 1, Protection: 3},
+		{GuestStart: 4096, Length: 4096, State: 2, Protection: 1, Flags: 2},
+		{GuestStart: 8192, Length: 4096, State: 3, Flags: 1},
+	}}
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer server.Close()
+		rw := bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server))
+		var request casimirFaultRequest
+		if err := json.NewDecoder(rw).Decode(&request); err != nil {
+			return
+		}
+		if request.Operation != "mappings" {
+			return
+		}
+		if err := json.NewEncoder(rw).Encode(response); err != nil {
+			return
+		}
+		_ = rw.Flush()
+	}()
+
+	regions, err := consumeCasimirMappings(
+		bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client)),
+		12288,
+	)
+	if err != nil {
+		t.Fatalf("consumeCasimirMappings() error = %v", err)
+	}
+	if !slices.Equal(regions, response.Regions) {
+		t.Fatalf("consumeCasimirMappings() = %+v, want exact signed table %+v", regions, response.Regions)
+	}
+}
+
+func TestConsumeCasimirMappingsRejectsUnknownAttributesAndOverflow(t *testing.T) {
+	tests := []struct {
+		name    string
+		regions []CasimirRegion
+		length  uint64
+	}{
+		{
+			name:    "unknown protection",
+			regions: []CasimirRegion{{GuestStart: 0, Length: 4096, State: 1, Protection: 8}},
+			length:  4096,
+		},
+		{
+			name:    "unknown flags",
+			regions: []CasimirRegion{{GuestStart: 0, Length: 4096, State: 1, Flags: 4}},
+			length:  4096,
+		},
+		{
+			name: "overflow",
+			regions: []CasimirRegion{
+				{GuestStart: 0, Length: ^uint64(0), State: 1},
+				{GuestStart: ^uint64(0), Length: 1, State: 1},
+			},
+			length: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			go func() {
+				defer server.Close()
+				rw := bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server))
+				var request casimirFaultRequest
+				if err := json.NewDecoder(rw).Decode(&request); err != nil {
+					return
+				}
+				if err := json.NewEncoder(rw).Encode(casimirFaultResponse{Regions: test.regions}); err != nil {
+					return
+				}
+				_ = rw.Flush()
+			}()
+			if regions, err := consumeCasimirMappings(
+				bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client)),
+				test.length,
+			); err == nil || len(regions) != 0 {
+				t.Fatalf("consumeCasimirMappings() = (%+v, %v), want fail-closed empty result", regions, err)
 			}
 		})
 	}

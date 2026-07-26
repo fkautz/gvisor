@@ -24,12 +24,41 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/timing"
 )
+
+// RestoreCasimirMappings reconciles the complete signed LLIFS mapping table
+// with every distinct restored MemoryManager while all tasks remain stopped.
+func (k *Kernel) RestoreCasimirMappings(ctx context.Context, regions []pgalloc.CasimirRegion) error {
+	if k == nil || k.tasks == nil {
+		return fmt.Errorf("missing restored kernel for Casimir mappings")
+	}
+	managers := make(map[*mm.MemoryManager]struct{})
+	k.tasks.mu.RLock()
+	for t := range k.tasks.Root.tids {
+		if manager := t.image.MemoryManager; manager != nil {
+			managers[manager] = struct{}{}
+		}
+		if state, ok := t.runState.(*runExecveAfterSiblingExitStop); ok && state.image != nil && state.image.MemoryManager != nil {
+			managers[state.image.MemoryManager] = struct{}{}
+		}
+	}
+	k.tasks.mu.RUnlock()
+	if len(managers) == 0 {
+		return fmt.Errorf("signed Casimir mappings found no restored address spaces")
+	}
+	for manager := range managers {
+		if err := manager.RestoreCasimirMappings(ctx, regions); err != nil {
+			return fmt.Errorf("restore signed Casimir address space: %w", err)
+		}
+	}
+	return nil
+}
 
 // Saver is an interface for saving the kernel.
 type Saver interface {

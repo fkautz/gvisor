@@ -128,6 +128,7 @@ go_library(
         "aio_context_state.go",
         "aio_manager_mutex.go",
         "aio_mappable_refs.go",
+        "casimir_restore.go",
         "debug.go",
         "io.go",
         "io_list.go",
@@ -182,7 +183,10 @@ go_library(
 go_test(
     name = "mm_test",
     size = "small",
-    srcs = ["mm_test.go"],
+    srcs = [
+        "casimir_restore_test.go",
+        "mm_test.go",
+    ],
     library = ":mm",
     deps = [
         "//pkg/context",

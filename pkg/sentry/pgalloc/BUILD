@@ -161,6 +161,7 @@ go_library(
         "apl_unloaded_set.go",
 		"context.go",
 		"casimir_fault_linux.go",
+        "casimir_mapping.go",
         "debug.go",
         "evictable_range.go",
         "evictable_range_set.go",

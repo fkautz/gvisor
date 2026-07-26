@@ -152,14 +152,6 @@ type casimirFaultRequest struct {
 	Length    uint64 `json:"length"`
 }
 
-type casimirRegion struct {
-	GuestStart uint64 `json:"guest_start"`
-	Length     uint64 `json:"length"`
-	State      uint8  `json:"state"`
-	Protection uint8  `json:"protection"`
-	Flags      uint8  `json:"flags"`
-}
-
 type casimirFaultResponse struct {
 	Error       string          `json:"error,omitempty"`
 	Zero        bool            `json:"zero,omitempty"`
@@ -167,7 +159,7 @@ type casimirFaultResponse struct {
 	Fatal       bool            `json:"fatal,omitempty"`
 	FaultAction string          `json:"fault_action"`
 	Data        []byte          `json:"data,omitempty"`
-	Regions     []casimirRegion `json:"regions,omitempty"`
+	Regions     []CasimirRegion `json:"regions,omitempty"`
 }
 
 func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pageSize uint64) (string, error) {
@@ -353,22 +345,22 @@ func verifyCasimirFaultBaseIdentity(readOnlyBase, faultBase *os.File) error {
 	return nil
 }
 
-func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) error {
+func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) ([]CasimirRegion, error) {
 	return startCasimirFaultsWithSyscalls(dataFile, start, length, linuxCasimirFaultSyscalls{})
 }
 
-func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls) error {
+func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls) ([]CasimirRegion, error) {
 	const flags = uintptr(unix.O_CLOEXEC | unix.O_NONBLOCK | uffdUserModeOnly)
 	fd, err := syscalls.userfaultfd(flags)
 	if err != nil {
-		return fmt.Errorf("userfaultfd(flags=%#x): %w", flags, err)
+		return nil, fmt.Errorf("userfaultfd(flags=%#x): %w", flags, err)
 	}
 	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem | uffdFeatureMinorShmem}
 	if err := syscalls.ioctl(fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); err != nil {
-		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_API: %w", err))
+		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_API: %w", err))
 	}
 	if api.Features&uffdFeatureMissingShmem == 0 || api.Features&uffdFeatureMinorShmem == 0 {
-		return closeCasimirFaultFD(
+		return nil, closeCasimirFaultFD(
 			syscalls,
 			fd,
 			fmt.Errorf("ioctl UFFDIO_API missing shmem features %#x: %w", api.Features, unix.ENOTSUP),
@@ -379,20 +371,21 @@ func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uin
 		Mode:  uffdioRegisterMissing | uffdioRegisterMinor,
 	}
 	if err := syscalls.ioctl(fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); err != nil {
-		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_REGISTER: %w", err))
+		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_REGISTER: %w", err))
 	}
 	conn, err := net.FileConn(dataFile)
 	dataFile.Close()
 	if err != nil {
-		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("open Casimir data connection: %w", err))
+		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("open Casimir data connection: %w", err))
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-	if err := consumeCasimirMappings(rw, length); err != nil {
+	regions, err := consumeCasimirMappings(rw, length)
+	if err != nil {
 		conn.Close()
-		return closeCasimirFaultFD(syscalls, fd, fmt.Errorf("consume Casimir mappings: %w", err))
+		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("consume Casimir mappings: %w", err))
 	}
 	go serveCasimirFaults(int(fd), conn, rw, uint64(start), length)
-	return nil
+	return regions, nil
 }
 
 func closeCasimirFaultFD(syscalls casimirFaultSyscalls, fd uintptr, cause error) error {
@@ -406,35 +399,37 @@ func closeCasimirFaultFD(syscalls casimirFaultSyscalls, fd uintptr, cause error)
 // before any guest fault is served (MLAYOUT-5). The table must tile the exact
 // shared-base span with valid signed states; any gap, overlap, or unknown
 // state fails the restore closed before guest resume.
-func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) error {
+func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) ([]CasimirRegion, error) {
 	if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "mappings"}); err != nil {
-		return err
+		return nil, err
 	}
 	if err := rw.Flush(); err != nil {
-		return err
+		return nil, err
 	}
 	var response casimirFaultResponse
 	if err := json.NewDecoder(rw).Decode(&response); err != nil {
-		return err
+		return nil, err
 	}
 	if response.Error != "" || len(response.Regions) == 0 {
 		log.Warningf("Casimir mapping table rejected: error=%q regions=%d", response.Error, len(response.Regions))
-		return unix.EINVAL
+		return nil, unix.EINVAL
 	}
 	var next uint64
 	for _, region := range response.Regions {
-		if region.GuestStart != next || region.Length == 0 || region.State < 1 || region.State > 3 {
+		if region.GuestStart != next || region.Length == 0 || region.State < 1 || region.State > 3 ||
+			region.Protection&^uint8(7) != 0 || region.Flags&^uint8(3) != 0 ||
+			region.GuestStart > ^uint64(0)-region.Length {
 			log.Warningf("Casimir mapping table is not a contiguous signed tiling at %#x", region.GuestStart)
-			return unix.EINVAL
+			return nil, unix.EINVAL
 		}
 		next += region.Length
 	}
 	if next != length {
 		log.Warningf("Casimir mapping table covers %#x bytes, want %#x", next, length)
-		return unix.EINVAL
+		return nil, unix.EINVAL
 	}
 	log.Infof("Casimir signed mapping table consumed: %d regions over %#x bytes", len(response.Regions), length)
-	return nil
+	return response.Regions, nil
 }
 
 func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, length uint64) {
