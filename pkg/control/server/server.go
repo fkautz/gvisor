@@ -135,16 +135,15 @@ func (s *Server) StartServing() error {
 	return nil
 }
 
-// RestartServingAfterFork restarts the accept loop in a post-fork child.
+// StartServingAfterRestore adds a fresh accept loop after restore.
 //
-// The control socket remains open and listening across the restore fork, but
-// goroutines other than the one that called fork do not survive in the child.
-// Consequently, the inherited WaitGroup count and accept loop no longer
-// describe live work. This method must only be called in the post-fork child.
-func (s *Server) RestartServingAfterFork() {
-	s.wg = sync.WaitGroup{}
-	s.stopping.Store(false)
-	s.serveErr.Store(nil)
+// Restore reconfigures the sandbox while the initial accept loop and an active
+// Restore RPC coexist. Starting another acceptor is safe for a listening Unix
+// socket and ensures that post-restore control requests do not depend on the
+// pre-restore goroutine surviving signal and runtime transitions. The existing
+// WaitGroup state must be preserved because the initial acceptor may still be
+// live.
+func (s *Server) StartServingAfterRestore() {
 	s.startServingLoop()
 }
 
