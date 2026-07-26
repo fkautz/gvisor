@@ -118,6 +118,12 @@ func (u userfaultfdWakeup) wakeFault(pageStart, pageSize uint64) error {
 func (u userfaultfdWakeup) zeroFault(pageStart, pageSize uint64) error {
 	request := uffdioZeropageRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioZeropage, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		// The verified canonical backing may have become resident after the
+		// kernel queued a MISSING event. In that exact race, map the now
+		// resident page rather than failing the restore.
+		if errno == unix.EEXIST {
+			return u.continueFault(pageStart, pageSize)
+		}
 		return errno
 	}
 	return nil
@@ -126,6 +132,13 @@ func (u userfaultfdWakeup) zeroFault(pageStart, pageSize uint64) error {
 func (u userfaultfdWakeup) copyFault(pageStart, pageSize uint64, data []byte) error {
 	request := uffdioCopyRequest{Dst: pageStart, Src: uint64(uintptr(unsafe.Pointer(&data[0]))), Len: pageSize}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioCopy, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		// Casimir publishes verified bytes into the same shared shmem backing
+		// before replying. If that publication wins the race with
+		// UFFDIO_COPY, EEXIST means the page is already canonical and only
+		// its missing PTE still needs to be continued.
+		if errno == unix.EEXIST {
+			return u.continueFault(pageStart, pageSize)
+		}
 		return errno
 	}
 	runtime.KeepAlive(data)
