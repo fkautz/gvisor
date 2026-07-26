@@ -262,11 +262,12 @@ func (c *controller) registerHandlers() {
 	}
 }
 
-// refreshHandlers resets the server and re-registers all handlers using l.
-// Useful when l.k has been replaced (e.g. during a restore).
-func (c *controller) refreshHandlers() {
+// refreshHandlersAfterFork resets the server, re-registers all handlers using
+// l, and recreates the accept loop that does not survive the restore fork.
+func (c *controller) refreshHandlersAfterFork() {
 	c.srv.ResetServer()
 	c.registerHandlers()
+	c.srv.RestartServingAfterFork()
 }
 
 func (c *controller) stop() {
