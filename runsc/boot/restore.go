@@ -506,6 +506,14 @@ func (r *restorer) restore(l *Loader) error {
 			r.timer.Reached("MFs loaded")
 		}
 	}
+	if regions, ok := r.mainMF.CasimirMappings(); ok {
+		if err := l.k.RestoreCasimirMappings(ctx, regions); err != nil {
+			return fmt.Errorf("reconcile signed Casimir mappings before resume: %w", err)
+		}
+		r.timer.Reached("Casimir mappings restored")
+	} else if r.mainMF.UsesCasimirFaults() {
+		return fmt.Errorf("Casimir fault service omitted signed mapping authority")
+	}
 
 	// Since we have a new kernel we also must make a new watchdog.
 	dogOpts := watchdog.DefaultOpts
