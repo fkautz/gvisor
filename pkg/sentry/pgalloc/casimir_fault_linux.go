@@ -24,6 +24,7 @@ const (
 	uffdFeatureMinorShmem   = 1 << 10
 	uffdioAPI               = 0xc018aa3f
 	uffdioRegister          = 0xc020aa00
+	uffdioUnregister        = 0x8010aa01
 	uffdioWake              = 0x8010aa02
 	uffdioCopy              = 0xc028aa03
 	uffdioZeropage          = 0xc020aa04
@@ -99,6 +100,14 @@ func (linuxCasimirFaultSyscalls) close(fd int) error {
 
 type userfaultfdWakeup int
 
+func (u userfaultfdWakeup) releaseFault(pageStart, pageSize uint64) error {
+	request := uffdioRange{Start: pageStart, Len: pageSize}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioUnregister, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 func (u userfaultfdWakeup) continueFault(pageStart, pageSize uint64) error {
 	request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
@@ -120,9 +129,10 @@ func (u userfaultfdWakeup) zeroFault(pageStart, pageSize uint64) error {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioZeropage, uintptr(unsafe.Pointer(&request))); errno != 0 {
 		// The verified canonical backing may have become resident after the
 		// kernel queued a MISSING event. In that exact race, map the now
-		// resident page rather than failing the restore.
+		// resident page by releasing this verified range from missing-fault
+		// interception rather than failing the restore.
 		if errno == unix.EEXIST {
-			return u.continueFault(pageStart, pageSize)
+			return u.releaseFault(pageStart, pageSize)
 		}
 		return errno
 	}
@@ -135,9 +145,9 @@ func (u userfaultfdWakeup) copyFault(pageStart, pageSize uint64, data []byte) er
 		// Casimir publishes verified bytes into the same shared shmem backing
 		// before replying. If that publication wins the race with
 		// UFFDIO_COPY, EEXIST means the page is already canonical and only
-		// its missing PTE still needs to be continued.
+		// its missing PTE still needs to be released from interception.
 		if errno == unix.EEXIST {
-			return u.continueFault(pageStart, pageSize)
+			return u.releaseFault(pageStart, pageSize)
 		}
 		return errno
 	}
