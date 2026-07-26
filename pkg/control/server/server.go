@@ -135,18 +135,6 @@ func (s *Server) StartServing() error {
 	return nil
 }
 
-// StartServingAfterRestore adds a fresh accept loop after restore.
-//
-// Restore reconfigures the sandbox while the initial accept loop and an active
-// Restore RPC coexist. Starting another acceptor is safe for a listening Unix
-// socket and ensures that post-restore control requests do not depend on the
-// pre-restore goroutine surviving signal and runtime transitions. The existing
-// WaitGroup state must be preserved because the initial acceptor may still be
-// live.
-func (s *Server) StartServingAfterRestore() {
-	s.startServingLoop()
-}
-
 func (s *Server) startServingLoop() {
 	ready := make(chan struct{})
 	s.wg.Add(1)

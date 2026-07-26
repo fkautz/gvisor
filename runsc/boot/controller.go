@@ -262,12 +262,12 @@ func (c *controller) registerHandlers() {
 	}
 }
 
-// refreshHandlersAfterRestore resets the server, re-registers all handlers
-// using l, and adds a fresh post-restore accept loop.
+// refreshHandlersAfterRestore resets the RPC dispatcher and re-registers all
+// handlers using l. The original accept loop remains the sole socket waiter;
+// pkg/unet retries EINTR across the restore transition.
 func (c *controller) refreshHandlersAfterRestore() {
 	c.srv.ResetServer()
 	c.registerHandlers()
-	c.srv.StartServingAfterRestore()
 }
 
 func (c *controller) stop() {

@@ -129,34 +129,6 @@ func TestServeTreatsIntentionalCloseAsCleanExit(t *testing.T) {
 	}
 }
 
-func TestStartServingAfterRestorePreservesExistingLoopState(t *testing.T) {
-	socket := &scriptedServerSocket{results: []scriptedAccept{{err: unix.EINVAL}}}
-	s := New(nil)
-	s.socket = socket
-	fatal := make(chan error, 1)
-	s.fatalExit = func(err error) {
-		fatal <- err
-	}
-
-	s.StartServingAfterRestore()
-	s.Wait()
-
-	if socket.listens != 0 {
-		t.Fatalf("StartServingAfterRestore called Listen %d times, want 0", socket.listens)
-	}
-	select {
-	case err := <-fatal:
-		if !errors.Is(err, unix.EINVAL) {
-			t.Fatalf("fatal exit error = %v, want EINVAL", err)
-		}
-	default:
-		t.Fatal("restarted accept loop did not run")
-	}
-	if !errors.Is(s.ServeError(), unix.EINVAL) {
-		t.Fatalf("ServeError() = %v, want EINVAL", s.ServeError())
-	}
-}
-
 type testState struct{}
 
 type testStateArgs struct {
