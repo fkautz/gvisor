@@ -361,6 +361,12 @@ func (w *recordingCasimirWakeup) continueFault(pageStart, pageSize uint64) error
 	return nil
 }
 
+func (w *recordingCasimirWakeup) wakeFault(pageStart, pageSize uint64) error {
+	w.calls = append(w.calls, "wake")
+	w.pageStart, w.pageSize = pageStart, pageSize
+	return nil
+}
+
 func (w *recordingCasimirWakeup) zeroFault(pageStart, pageSize uint64) error {
 	w.calls = append(w.calls, "zero")
 	w.pageStart, w.pageSize = pageStart, pageSize
@@ -383,6 +389,14 @@ func TestResolveCasimirFaultUsesExplicitActionAsSoleWakeupAuthority(t *testing.T
 		want     string
 	}{
 		{
+			name: "continue published missing page",
+			mode: "missing",
+			response: casimirFaultResponse{
+				FaultAction: "wake",
+			},
+			want: "continue",
+		},
+		{
 			name: "copy",
 			mode: "missing",
 			response: casimirFaultResponse{
@@ -394,14 +408,6 @@ func TestResolveCasimirFaultUsesExplicitActionAsSoleWakeupAuthority(t *testing.T
 		{
 			name: "continue",
 			mode: "minor",
-			response: casimirFaultResponse{
-				FaultAction: "continue",
-			},
-			want: "continue",
-		},
-		{
-			name: "continue after missing publication",
-			mode: "missing",
 			response: casimirFaultResponse{
 				FaultAction: "continue",
 			},
@@ -447,7 +453,13 @@ func TestResolveCasimirFaultRejectsWithoutWakeup(t *testing.T) {
 		response casimirFaultResponse
 	}{
 		{name: "missing action", mode: "missing", response: casimirFaultResponse{Data: page}},
-		{name: "unknown action", mode: "missing", response: casimirFaultResponse{FaultAction: "wake", Data: page}},
+		{name: "unknown action", mode: "missing", response: casimirFaultResponse{FaultAction: "unknown"}},
+		{name: "wake for minor", mode: "minor", response: casimirFaultResponse{FaultAction: "wake"}},
+		{name: "wake with error", mode: "missing", response: casimirFaultResponse{FaultAction: "wake", Error: "verification failed"}},
+		{name: "wake with fatal", mode: "missing", response: casimirFaultResponse{FaultAction: "wake", Fatal: true}},
+		{name: "wake with data", mode: "missing", response: casimirFaultResponse{FaultAction: "wake", Data: page}},
+		{name: "wake with zero", mode: "missing", response: casimirFaultResponse{FaultAction: "wake", Zero: true}},
+		{name: "wake with continue", mode: "missing", response: casimirFaultResponse{FaultAction: "wake", Continue: true}},
 		{name: "fatal", mode: "missing", response: casimirFaultResponse{FaultAction: "fatal", Fatal: true, Error: "verification failed"}},
 		{name: "fatal without error", mode: "missing", response: casimirFaultResponse{FaultAction: "fatal", Fatal: true}},
 		{name: "fatal with data", mode: "missing", response: casimirFaultResponse{FaultAction: "fatal", Fatal: true, Error: "verification failed", Data: page}},
@@ -458,6 +470,7 @@ func TestResolveCasimirFaultRejectsWithoutWakeup(t *testing.T) {
 		{name: "copy without data", mode: "missing", response: casimirFaultResponse{FaultAction: "copy"}},
 		{name: "copy short data", mode: "missing", response: casimirFaultResponse{FaultAction: "copy", Data: page[:4095]}},
 		{name: "copy for minor", mode: "minor", response: casimirFaultResponse{FaultAction: "copy", Data: page}},
+		{name: "continue for missing", mode: "missing", response: casimirFaultResponse{FaultAction: "continue"}},
 		{name: "continue with error", mode: "minor", response: casimirFaultResponse{FaultAction: "continue", Error: "verification failed"}},
 		{name: "continue with fatal", mode: "minor", response: casimirFaultResponse{FaultAction: "continue", Fatal: true}},
 		{name: "continue with data", mode: "minor", response: casimirFaultResponse{FaultAction: "continue", Continue: true, Data: page}},
@@ -499,7 +512,7 @@ func TestResolveCasimirFaultRejectsMalformedResponseWithoutWakeup(t *testing.T) 
 	}()
 	wakeup := &recordingCasimirWakeup{}
 	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
-	if err := resolveCasimirFault(rw, wakeup, "missing", 4096, 0x12345, 4096); err == nil {
+	if _, err := resolveCasimirFault(rw, wakeup, "missing", 4096, 0x12345, 4096); err == nil {
 		t.Fatal("resolveCasimirFault() error = nil, want malformed-response rejection")
 	}
 	if len(wakeup.calls) != 0 {
@@ -525,10 +538,136 @@ func exchangeCasimirFault(t testing.TB, mode string, response casimirFaultRespon
 	}()
 	wakeup := &recordingCasimirWakeup{}
 	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
-	err := resolveCasimirFault(rw, wakeup, mode, 4096, 0x12345, 4096)
+	_, err := resolveCasimirFault(rw, wakeup, mode, 4096, 0x12345, 4096)
 	request := <-requests
 	if serverErr := <-serverErrors; serverErr != nil {
 		t.Fatalf("fault response server error = %v", serverErr)
 	}
 	return request, wakeup, err
+}
+
+func TestCasimirFaultTransitionsWakeThenMinorContinue(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	serverErrors := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		decoder := json.NewDecoder(server)
+		encoder := json.NewEncoder(server)
+		for _, response := range []casimirFaultResponse{
+			{FaultAction: "wake"},
+			{FaultAction: "continue"},
+		} {
+			var request casimirFaultRequest
+			if err := decoder.Decode(&request); err != nil {
+				serverErrors <- err
+				return
+			}
+			if err := encoder.Encode(response); err != nil {
+				serverErrors <- err
+				return
+			}
+		}
+		serverErrors <- nil
+	}()
+
+	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	wakeup := &recordingCasimirWakeup{}
+	transitions := casimirFaultTransitions{}
+	const (
+		offset   = uint64(4096)
+		address  = uint64(0x12345)
+		pageSize = uint64(4096)
+		page     = uint64(0x12000)
+	)
+	if err := transitions.resolve(rw, wakeup, "missing", offset, address, pageSize); err != nil {
+		t.Fatalf("MISSING publish/wake error = %v", err)
+	}
+	if got := transitions.pending[page]; got != pageSize {
+		t.Fatalf("pending exact range length = %d, want %d", got, pageSize)
+	}
+	if err := transitions.resolve(rw, wakeup, "minor", offset, address, pageSize); err != nil {
+		t.Fatalf("retried MINOR continue error = %v", err)
+	}
+	if _, pending := transitions.pending[page]; pending {
+		t.Fatal("retried MINOR/CONTINUE did not clear pending wake")
+	}
+	if got := strings.Join(wakeup.calls, ","); got != "continue,continue" {
+		t.Fatalf("wakeup calls = %q, want continue,continue", got)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatalf("fault server error = %v", err)
+	}
+}
+
+func TestCasimirFaultTransitionsTreatPendingMissingAsMinorContinue(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan error, 1)
+	requestModes := make(chan string, 2)
+	go func() {
+		defer server.Close()
+		decoder := json.NewDecoder(server)
+		encoder := json.NewEncoder(server)
+		for _, response := range []casimirFaultResponse{
+			{FaultAction: "wake"},
+			{FaultAction: "continue"},
+		} {
+			var request casimirFaultRequest
+			if err := decoder.Decode(&request); err != nil {
+				serverDone <- err
+				return
+			}
+			requestModes <- request.FaultMode
+			if err := encoder.Encode(response); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		serverDone <- nil
+	}()
+	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	wakeup := &recordingCasimirWakeup{}
+	transitions := casimirFaultTransitions{}
+	if err := transitions.resolve(rw, wakeup, "missing", 4096, 0x12345, 4096); err != nil {
+		t.Fatalf("first MISSING error = %v", err)
+	}
+	if err := transitions.resolve(rw, wakeup, "missing", 4096, 0x12345, 4096); err != nil {
+		t.Fatalf("pending MISSING retry error = %v", err)
+	}
+	if got := []string{<-requestModes, <-requestModes}; !equalStrings(got, []string{"missing", "minor"}) {
+		t.Fatalf("wire fault modes = %q, want [missing minor]", got)
+	}
+	if got := strings.Join(wakeup.calls, ","); got != "continue,continue" {
+		t.Fatalf("pending MISSING wakeups = %q, want continue,continue", got)
+	}
+	if len(transitions.pending) != 0 {
+		t.Fatalf("pending transition not cleared: %v", transitions.pending)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("fault server error = %v", err)
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestResolveCasimirFaultRejectsMalformedModeBeforeWireOrWake(t *testing.T) {
+	wakeup := &recordingCasimirWakeup{}
+	rw := bufio.NewReadWriter(bufio.NewReader(bytes.NewReader(nil)), bufio.NewWriter(&bytes.Buffer{}))
+	if _, err := resolveCasimirFault(rw, wakeup, "write-protect", 0, 0x1000, 4096); !errors.Is(err, unix.EINVAL) {
+		t.Fatalf("malformed mode error = %v, want EINVAL", err)
+	}
+	if len(wakeup.calls) != 0 {
+		t.Fatalf("malformed mode issued wakeups %v", wakeup.calls)
+	}
 }

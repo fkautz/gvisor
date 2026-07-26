@@ -24,6 +24,7 @@ const (
 	uffdFeatureMinorShmem   = 1 << 10
 	uffdioAPI               = 0xc018aa3f
 	uffdioRegister          = 0xc020aa00
+	uffdioWake              = 0x8010aa02
 	uffdioCopy              = 0xc028aa03
 	uffdioZeropage          = 0xc020aa04
 	uffdioContinue          = 0xc020aa07
@@ -64,6 +65,7 @@ type uffdioContinueRequest struct {
 
 type casimirFaultWakeup interface {
 	continueFault(pageStart, pageSize uint64) error
+	wakeFault(pageStart, pageSize uint64) error
 	zeroFault(pageStart, pageSize uint64) error
 	copyFault(pageStart, pageSize uint64, data []byte) error
 }
@@ -100,6 +102,14 @@ type userfaultfdWakeup int
 func (u userfaultfdWakeup) continueFault(pageStart, pageSize uint64) error {
 	request := uffdioContinueRequest{Range: uffdioRange{Start: pageStart, Len: pageSize}}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioContinue, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (u userfaultfdWakeup) wakeFault(pageStart, pageSize uint64) error {
+	request := uffdioRange{Start: pageStart, Len: pageSize}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioWake, uintptr(unsafe.Pointer(&request))); errno != 0 {
 		return errno
 	}
 	return nil
@@ -152,13 +162,18 @@ func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pa
 		return "", fmt.Errorf("reject Casimir fault response: %s: %w", reason, unix.EINVAL)
 	}
 	switch response.FaultAction {
+	case "wake":
+		if mode != "missing" || response.Error != "" || response.Fatal || response.Zero || response.Continue ||
+			len(response.Data) != 0 {
+			return reject("invalid wake action")
+		}
 	case "copy":
 		if mode != "missing" || response.Error != "" || response.Fatal || response.Zero || response.Continue ||
 			uint64(len(response.Data)) != pageSize {
 			return reject("invalid copy action")
 		}
 	case "continue":
-		if (mode != "missing" && mode != "minor") || response.Error != "" || response.Fatal || response.Zero || len(response.Data) != 0 {
+		if mode != "minor" || response.Error != "" || response.Fatal || response.Zero || len(response.Data) != 0 {
 			return reject("invalid continue action")
 		}
 	case "zero":
@@ -176,37 +191,84 @@ func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pa
 	return response.FaultAction, nil
 }
 
-func resolveCasimirFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode string, offset, address, pageSize uint64) error {
+func resolveCasimirFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode string, offset, address, pageSize uint64) (string, error) {
+	if (mode != "missing" && mode != "minor") || pageSize == 0 || pageSize&(pageSize-1) != 0 {
+		return "", fmt.Errorf("reject Casimir fault request mode=%q page_size=%d: %w", mode, pageSize, unix.EINVAL)
+	}
 	if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "fault", FaultMode: mode, Offset: offset, Length: pageSize}); err != nil {
-		return fmt.Errorf("encode Casimir fault request: %w", err)
+		return "", fmt.Errorf("encode Casimir fault request: %w", err)
 	}
 	if err := rw.Flush(); err != nil {
-		return fmt.Errorf("flush Casimir fault request: %w", err)
+		return "", fmt.Errorf("flush Casimir fault request: %w", err)
 	}
 	var response casimirFaultResponse
 	if err := json.NewDecoder(rw).Decode(&response); err != nil {
-		return fmt.Errorf("decode Casimir fault response: %w", err)
+		return "", fmt.Errorf("decode Casimir fault response: %w", err)
 	}
 	action, err := validateCasimirFaultResponse(response, mode, pageSize)
 	if err != nil {
-		return err
+		return "", err
 	}
 	pageStart := address &^ (pageSize - 1)
 	switch action {
+	case "wake":
+		// Casimir has already materialized the verified page into the shared
+		// shmem page cache. Complete the fault with UFFDIO_CONTINUE directly;
+		// UFFDIO_WAKE does not resolve this registered missing fault and is
+		// rejected by the kernel on the real restore path.
+		if err := wakeup.continueFault(pageStart, pageSize); err != nil {
+			return "", fmt.Errorf("continue Casimir published page: %w", err)
+		}
 	case "continue":
 		if err := wakeup.continueFault(pageStart, pageSize); err != nil {
-			return fmt.Errorf("continue Casimir resident page: %w", err)
+			return "", fmt.Errorf("continue Casimir resident page: %w", err)
 		}
 	case "zero":
 		if err := wakeup.zeroFault(pageStart, pageSize); err != nil {
-			return fmt.Errorf("install Casimir verified zero: %w", err)
+			return "", fmt.Errorf("install Casimir verified zero: %w", err)
 		}
 	case "copy":
 		if err := wakeup.copyFault(pageStart, pageSize, response.Data); err != nil {
-			return fmt.Errorf("install Casimir verified page: %w", err)
+			return "", fmt.Errorf("install Casimir verified page: %w", err)
 		}
 	default:
-		return fmt.Errorf("unhandled Casimir fault action %q: %w", action, unix.EINVAL)
+		return "", fmt.Errorf("unhandled Casimir fault action %q: %w", action, unix.EINVAL)
+	}
+	return action, nil
+}
+
+// casimirFaultTransitions bounds the MISSING publish/retry protocol. One
+// MISSING may wake one exact page range; that authorization remains pending
+// until the same resident page is continued. Linux may report the post-wake
+// retry with the original MISSING flag even though the shmem page is now
+// resident, so an exact pending retry is presented to Casimir as MINOR. This
+// permits one CONTINUE without allowing another publish/wake cycle.
+type casimirFaultTransitions struct {
+	pending map[uint64]uint64
+}
+
+func (t *casimirFaultTransitions) resolve(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode string, offset, address, pageSize uint64) error {
+	if pageSize == 0 || pageSize&(pageSize-1) != 0 {
+		return fmt.Errorf("invalid Casimir fault page size %d: %w", pageSize, unix.EINVAL)
+	}
+	pageStart := address &^ (pageSize - 1)
+	if mode == "missing" && t.pending[pageStart] == pageSize {
+		mode = "minor"
+	}
+	action, err := resolveCasimirFault(rw, wakeup, mode, offset, address, pageSize)
+	if err != nil {
+		return err
+	}
+	switch {
+	case mode == "missing" && action == "wake":
+		if t.pending == nil {
+			t.pending = make(map[uint64]uint64)
+		}
+		t.pending[pageStart] = pageSize
+	case mode == "minor" && action == "continue":
+		if t.pending[pageStart] == pageSize {
+			delete(t.pending, pageStart)
+		}
 	}
 	return nil
 }
@@ -371,6 +433,7 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 	defer unix.Kill(os.Getpid(), unix.SIGKILL)
 	var msg [32]byte
 	pageSize := uint64(os.Getpagesize())
+	transitions := casimirFaultTransitions{}
 	for {
 		if _, err := unix.Poll([]unix.PollFd{{Fd: int32(uffd), Events: unix.POLLIN}}, -1); err != nil {
 			if err == unix.EINTR {
@@ -402,7 +465,7 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 		if flags&uffdPagefaultFlagMinor != 0 {
 			mode = "minor"
 		}
-		if err := resolveCasimirFault(rw, userfaultfdWakeup(uffd), mode, offset, address, pageSize); err != nil {
+		if err := transitions.resolve(rw, userfaultfdWakeup(uffd), mode, offset, address, pageSize); err != nil {
 			log.Warningf("Casimir fault resolution failed: %v", err)
 			return
 		}
