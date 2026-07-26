@@ -18,8 +18,8 @@ package state
 import (
 	"errors"
 	"fmt"
-	"os"
 	"io"
+	"os"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -60,6 +60,11 @@ type SaveOpts struct {
 	// against it (GVISOR-3 C1b).
 	SharedBaseFile *os.File
 
+	// CasimirLayout is the authoritative per-address-space LLML2 sidecar.
+	// It is captured while tasks are paused, before checkpoint state is
+	// published.
+	CasimirLayout io.WriteCloser
+
 	// Key is used to enable state integrity check.
 	Key []byte
 
@@ -90,7 +95,7 @@ type SaveOpts struct {
 
 // Close releases resources owned by opts.
 func (opts *SaveOpts) Close() error {
-	var dstErr, pmErr, pfErr error
+	var dstErr, pmErr, pfErr, layoutErr error
 	if c, ok := opts.Destination.(io.Closer); ok {
 		dstErr = c.Close()
 	}
@@ -100,7 +105,10 @@ func (opts *SaveOpts) Close() error {
 	if opts.PagesFile != nil {
 		pfErr = opts.PagesFile.Close()
 	}
-	return errors.Join(dstErr, pmErr, pfErr)
+	if opts.CasimirLayout != nil {
+		layoutErr = opts.CasimirLayout.Close()
+	}
+	return errors.Join(dstErr, pmErr, pfErr, layoutErr)
 }
 
 // Save saves the system state.
@@ -155,6 +163,16 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		opts.Metadata[GvisorWallTimeKey] = wt.String()
 	}
 	addSaveMetadata(opts.Metadata)
+
+	if opts.CasimirLayout != nil {
+		if err := k.SaveCasimirLayout(ctx, opts.CasimirLayout); err != nil {
+			return fmt.Errorf("capture authoritative Casimir layout: %w", err)
+		}
+		if err := opts.CasimirLayout.Close(); err != nil {
+			return fmt.Errorf("close authoritative Casimir layout: %w", err)
+		}
+		opts.CasimirLayout = nil
+	}
 
 	// Open the statefile.
 	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil

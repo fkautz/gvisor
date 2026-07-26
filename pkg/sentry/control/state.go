@@ -160,7 +160,7 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 		wantFiles += 2
 	}
 	if o.SharedBase {
-		wantFiles++
+		wantFiles += 2
 	}
 	if gotFiles := len(o.FilePayload.Files); gotFiles != wantFiles {
 		return fmt.Errorf("got %d files, wanted %d", gotFiles, wantFiles)
@@ -197,6 +197,11 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 			return err
 		}
 		saveOpts.SharedBaseFile = os.NewFile(uintptr(baseFD), "base.img")
+		layoutFD, err := unix.Dup(int(o.Files[4].Fd()))
+		if err != nil {
+			return err
+		}
+		saveOpts.CasimirLayout = os.NewFile(uintptr(layoutFD), "casimir_layout.img")
 	}
 	return nil
 }

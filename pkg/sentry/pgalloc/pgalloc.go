@@ -209,9 +209,9 @@ type MemoryFile struct {
 	// backing. userfaultfd MISSING|MINOR is registered on this alias rather
 	// than on chunks' writable MAP_PRIVATE overlay: MapInternal faults the
 	// alias first, then returns the private overlay for guest COW writes.
-	casimirFaultMapping    uintptr         `state:"nosave"`
-	casimirFaultMappingLen uint64          `state:"nosave"`
-	casimirMappings        []CasimirRegion `state:"nosave"`
+	casimirFaultMapping    uintptr       `state:"nosave"`
+	casimirFaultMappingLen uint64        `state:"nosave"`
+	casimirMappings        CasimirLayout `state:"nosave"`
 
 	// file is the backing file. The file pointer is immutable.
 	file *os.File

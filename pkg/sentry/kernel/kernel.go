@@ -36,6 +36,7 @@
 package kernel
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -170,6 +171,11 @@ type Kernel struct {
 
 	// mf provides application memory.
 	mf *pgalloc.MemoryFile `state:"nosave"`
+
+	// casimirLayoutDigest commits checkpoint state to the authoritative LLML2
+	// sidecar captured from this kernel. It is verified after LoadFrom and
+	// before any task resumes.
+	casimirLayoutDigest [sha256.Size]byte
 
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet

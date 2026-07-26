@@ -1754,6 +1754,12 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 			return fmt.Errorf("creating base image %q: %w", basePath, err)
 		}
 		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
+		layoutPath := filepath.Join(imagePath, "casimir_layout.img")
+		layoutFile, err := os.OpenFile(layoutPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("creating Casimir layout %q: %w", layoutPath, err)
+		}
+		opt.FilePayload.Files = append(opt.FilePayload.Files, layoutFile)
 		opt.SharedBase = true
 	}
 	return nil

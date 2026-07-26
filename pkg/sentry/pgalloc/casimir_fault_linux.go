@@ -160,6 +160,7 @@ type casimirFaultResponse struct {
 	FaultAction string          `json:"fault_action"`
 	Data        []byte          `json:"data,omitempty"`
 	Regions     []CasimirRegion `json:"regions,omitempty"`
+	Layout      CasimirLayout   `json:"layout,omitempty"`
 }
 
 func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pageSize uint64) (string, error) {
@@ -345,22 +346,22 @@ func verifyCasimirFaultBaseIdentity(readOnlyBase, faultBase *os.File) error {
 	return nil
 }
 
-func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) ([]CasimirRegion, error) {
+func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) (CasimirLayout, error) {
 	return startCasimirFaultsWithSyscalls(dataFile, start, length, linuxCasimirFaultSyscalls{})
 }
 
-func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls) ([]CasimirRegion, error) {
+func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls) (CasimirLayout, error) {
 	const flags = uintptr(unix.O_CLOEXEC | unix.O_NONBLOCK | uffdUserModeOnly)
 	fd, err := syscalls.userfaultfd(flags)
 	if err != nil {
-		return nil, fmt.Errorf("userfaultfd(flags=%#x): %w", flags, err)
+		return CasimirLayout{}, fmt.Errorf("userfaultfd(flags=%#x): %w", flags, err)
 	}
 	api := uffdioAPIRequest{API: uffdAPI, Features: uffdFeatureMissingShmem | uffdFeatureMinorShmem}
 	if err := syscalls.ioctl(fd, uffdioAPI, uintptr(unsafe.Pointer(&api))); err != nil {
-		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_API: %w", err))
+		return CasimirLayout{}, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_API: %w", err))
 	}
 	if api.Features&uffdFeatureMissingShmem == 0 || api.Features&uffdFeatureMinorShmem == 0 {
-		return nil, closeCasimirFaultFD(
+		return CasimirLayout{}, closeCasimirFaultFD(
 			syscalls,
 			fd,
 			fmt.Errorf("ioctl UFFDIO_API missing shmem features %#x: %w", api.Features, unix.ENOTSUP),
@@ -371,18 +372,18 @@ func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uin
 		Mode:  uffdioRegisterMissing | uffdioRegisterMinor,
 	}
 	if err := syscalls.ioctl(fd, uffdioRegister, uintptr(unsafe.Pointer(&registration))); err != nil {
-		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_REGISTER: %w", err))
+		return CasimirLayout{}, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("ioctl UFFDIO_REGISTER: %w", err))
 	}
 	conn, err := net.FileConn(dataFile)
 	dataFile.Close()
 	if err != nil {
-		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("open Casimir data connection: %w", err))
+		return CasimirLayout{}, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("open Casimir data connection: %w", err))
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	regions, err := consumeCasimirMappings(rw, length)
 	if err != nil {
 		conn.Close()
-		return nil, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("consume Casimir mappings: %w", err))
+		return CasimirLayout{}, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("consume Casimir mappings: %w", err))
 	}
 	go serveCasimirFaults(int(fd), conn, rw, uint64(start), length)
 	return regions, nil
@@ -399,37 +400,49 @@ func closeCasimirFaultFD(syscalls casimirFaultSyscalls, fd uintptr, cause error)
 // before any guest fault is served (MLAYOUT-5). The table must tile the exact
 // shared-base span with valid signed states; any gap, overlap, or unknown
 // state fails the restore closed before guest resume.
-func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) ([]CasimirRegion, error) {
+func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) (CasimirLayout, error) {
 	if err := json.NewEncoder(rw).Encode(casimirFaultRequest{Operation: "mappings"}); err != nil {
-		return nil, err
+		return CasimirLayout{}, err
 	}
 	if err := rw.Flush(); err != nil {
-		return nil, err
+		return CasimirLayout{}, err
 	}
 	var response casimirFaultResponse
 	if err := json.NewDecoder(rw).Decode(&response); err != nil {
-		return nil, err
+		return CasimirLayout{}, err
 	}
-	if response.Error != "" || len(response.Regions) == 0 {
-		log.Warningf("Casimir mapping table rejected: error=%q regions=%d", response.Error, len(response.Regions))
-		return nil, unix.EINVAL
+	if response.Error != "" || response.Layout.Version != 2 || response.Layout.PageSize == 0 || len(response.Layout.AddressSpaces) == 0 || len(response.Regions) != 0 {
+		log.Warningf("Casimir LLML2 layout rejected: error=%q version=%d address_spaces=%d legacy_regions=%d", response.Error, response.Layout.Version, len(response.Layout.AddressSpaces), len(response.Regions))
+		return CasimirLayout{}, unix.EINVAL
 	}
-	var next uint64
-	for _, region := range response.Regions {
-		if region.GuestStart != next || region.Length == 0 || region.State < 1 || region.State > 3 ||
-			region.Protection&^uint8(7) != 0 || region.Flags&^uint8(3) != 0 ||
-			region.GuestStart > ^uint64(0)-region.Length {
-			log.Warningf("Casimir mapping table is not a contiguous signed tiling at %#x", region.GuestStart)
-			return nil, unix.EINVAL
+	var previous CasimirAuthorityID
+	for i, addressSpace := range response.Layout.AddressSpaces {
+		if addressSpace.MinAddr >= addressSpace.MaxAddr || len(addressSpace.Regions) == 0 || (i != 0 && string(previous[:]) >= string(addressSpace.Identity[:])) {
+			return CasimirLayout{}, unix.EINVAL
 		}
-		next += region.Length
+		next := addressSpace.MinAddr
+		for _, region := range addressSpace.Regions {
+			if region.GuestStart != next || region.Length == 0 || region.State < 1 || region.State > 3 ||
+				region.Protection&^uint8(7) != 0 || region.Flags&^uint8(3) != 0 ||
+				region.GuestStart > ^uint64(0)-region.Length {
+				return CasimirLayout{}, unix.EINVAL
+			}
+			if region.State == 1 && region.BackingKind == CasimirBackingNone ||
+				region.State != 1 && (region.BackingKind != CasimirBackingNone || region.Backing != (CasimirAuthorityID{}) || region.ObjectOffset != 0) {
+				return CasimirLayout{}, unix.EINVAL
+			}
+			if region.BackingKind == CasimirBackingBaseMemory && region.ObjectOffset+region.Length > length {
+				return CasimirLayout{}, unix.EINVAL
+			}
+			next += region.Length
+		}
+		if next != addressSpace.MaxAddr {
+			return CasimirLayout{}, unix.EINVAL
+		}
+		previous = addressSpace.Identity
 	}
-	if next != length {
-		log.Warningf("Casimir mapping table covers %#x bytes, want %#x", next, length)
-		return nil, unix.EINVAL
-	}
-	log.Infof("Casimir signed mapping table consumed: %d regions over %#x bytes", len(response.Regions), length)
-	return response.Regions, nil
+	log.Infof("Casimir signed LLML2 layout consumed: %d address spaces", len(response.Layout.AddressSpaces))
+	return response.Layout.Clone(), nil
 }
 
 func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, length uint64) {

@@ -1,7 +1,9 @@
 package mm
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"reflect"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -9,139 +11,165 @@ import (
 )
 
 const (
-	casimirProtectionRead = 1 << iota
-	casimirProtectionWrite
-	casimirProtectionExecute
+	casimirStateMappedData = 1
+	casimirStateMappedZero = 2
+	casimirStateUnmapped   = 3
+
+	casimirRegionGuard  = 1
+	casimirRegionShared = 2
 )
 
-const (
-	casimirRegionGuard = 1 << iota
-	casimirRegionShared
-)
-
-type casimirRestoreAction struct {
-	addr       hostarch.Addr
-	length     uint64
-	protection hostarch.AccessType
-	unmap      bool
-}
-
-// RestoreCasimirMappings binds the authenticated LLIFS mapping table to this
-// restored address space. It plans the complete reconciliation while holding
-// read locks, rejects any geometry or sharing mismatch, then reapplies exact
-// permissions and removes signed guard/unmapped ranges before task resume.
-func (mm *MemoryManager) RestoreCasimirMappings(ctx context.Context, regions []pgalloc.CasimirRegion) error {
-	if mm == nil || len(regions) == 0 {
-		return fmt.Errorf("missing Casimir mapping authority")
+// CaptureCasimirAddressSpace derives LLML2 geometry from the MemoryManager's
+// authoritative VMA and PMA graphs. In particular, it records lazy anonymous
+// ranges for which no PMA exists and explicit gaps between VMAs.
+func (mm *MemoryManager) CaptureCasimirAddressSpace(ctx context.Context, identity pgalloc.CasimirAuthorityID) (pgalloc.CasimirAddressSpace, error) {
+	if mm == nil {
+		return pgalloc.CasimirAddressSpace{}, fmt.Errorf("missing MemoryManager")
 	}
-	if err := validateCasimirRegions(regions); err != nil {
-		return err
+	out := pgalloc.CasimirAddressSpace{
+		Identity: identity,
+		MinAddr:  uint64(mm.layout.MinAddr),
+		MaxAddr:  uint64(mm.layout.MaxAddr),
+	}
+	if out.MinAddr >= out.MaxAddr {
+		return pgalloc.CasimirAddressSpace{}, fmt.Errorf("invalid address-space bounds %#x-%#x", out.MinAddr, out.MaxAddr)
 	}
 
 	mm.mappingMu.RLock()
 	mm.activeMu.RLock()
-	var actions []casimirRestoreAction
-	var bound bool
-	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
-		pma := pseg.ValuePtr()
-		if pma.file != mm.mf {
+	defer mm.activeMu.RUnlock()
+	defer mm.mappingMu.RUnlock()
+
+	cursor := mm.layout.MinAddr
+	for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
+		if vseg.End() <= mm.layout.MinAddr || vseg.Start() >= mm.layout.MaxAddr {
 			continue
 		}
-		fileStart := pma.off
-		fileEnd := fileStart + uint64(pseg.Range().Length())
-		if fileEnd < fileStart {
-			mm.activeMu.RUnlock()
-			mm.mappingMu.RUnlock()
-			return fmt.Errorf("restored Casimir PMA range overflows")
+		start := max(vseg.Start(), mm.layout.MinAddr)
+		end := min(vseg.End(), mm.layout.MaxAddr)
+		v := vseg.ValuePtr()
+		if cursor < start {
+			flags := uint8(0)
+			if v.growsDown {
+				flags = casimirRegionGuard
+			}
+			appendCasimirRegion(&out.Regions, pgalloc.CasimirRegion{
+				GuestStart: uint64(cursor), Length: uint64(start - cursor),
+				State: casimirStateUnmapped, Flags: flags,
+			})
 		}
-		for fileStart < fileEnd {
-			region, ok := casimirRegionAt(regions, fileStart)
-			if !ok {
-				mm.activeMu.RUnlock()
-				mm.mappingMu.RUnlock()
-				return fmt.Errorf("restored PMA offset %#x lacks signed mapping", fileStart)
+		for at := start; at < end; {
+			next := end
+			region := pgalloc.CasimirRegion{
+				GuestStart: uint64(at),
+				Protection: casimirProtection(v.realPerms),
 			}
-			regionEnd := region.GuestStart + region.Length
-			chunkEnd := min(fileEnd, regionEnd)
-			chunkLength := chunkEnd - fileStart
-			virtualStart := pseg.Start() + hostarch.Addr(fileStart-pma.off)
-			vseg := mm.vmas.FindSegment(virtualStart)
-			if !vseg.Ok() || uint64(vseg.End()-virtualStart) < chunkLength {
-				mm.activeMu.RUnlock()
-				mm.mappingMu.RUnlock()
-				return fmt.Errorf("restored PMA at %#x is not bound to one complete VMA", virtualStart)
+			if !v.private {
+				region.Flags |= casimirRegionShared
 			}
-			vma := vseg.ValuePtr()
-			unmap := region.State == 3 || region.Flags&casimirRegionGuard != 0
-			if !unmap {
-				wantPrivate := region.Flags&casimirRegionShared == 0
-				if vma.private != wantPrivate {
-					mm.activeMu.RUnlock()
-					mm.mappingMu.RUnlock()
-					return fmt.Errorf("restored VMA at %#x shared/private attribute differs from signed mapping", virtualStart)
+			if v.realPerms == (hostarch.AccessType{}) {
+				region.State = casimirStateUnmapped
+			} else if v.mappable != nil {
+				region.State = casimirStateMappedData
+				region.BackingKind = pgalloc.CasimirBackingCheckpointObject
+				region.Backing = mappingIdentity(v, ctx)
+				region.ObjectOffset = v.off + uint64(at-vseg.Start())
+			} else if pseg := mm.pmas.FindSegment(at); pseg.Ok() {
+				if pseg.End() < next {
+					next = pseg.End()
+				}
+				p := pseg.ValuePtr()
+				region.State = casimirStateMappedData
+				region.ObjectOffset = p.off + uint64(at-pseg.Start())
+				if p.file == mm.mf {
+					region.BackingKind = pgalloc.CasimirBackingBaseMemory
+					region.Backing = sha256.Sum256([]byte("gvisor.main-memory-file.v1"))
+				} else {
+					region.BackingKind = pgalloc.CasimirBackingCheckpointObject
+					backing, ok := p.file.(*pgalloc.MemoryFile)
+					if !ok || !backing.ResourceID().Ok() {
+						return pgalloc.CasimirAddressSpace{}, fmt.Errorf("non-main PMA at %#x lacks stable checkpoint ResourceID", at)
+					}
+					region.Backing = sha256.Sum256([]byte("gvisor.memory-file.v1:" + backing.ResourceID().String()))
+				}
+			} else {
+				region.State = casimirStateMappedZero
+				if gap := mm.pmas.FindGap(at); gap.Ok() && gap.End() < next {
+					next = gap.End()
 				}
 			}
-			actions = append(actions, casimirRestoreAction{
-				addr:       virtualStart,
-				length:     chunkLength,
-				protection: casimirAccessType(region.Protection),
-				unmap:      unmap,
-			})
-			bound = true
-			fileStart = chunkEnd
+			region.Length = uint64(next - at)
+			appendCasimirRegion(&out.Regions, region)
+			at = next
 		}
+		cursor = end
 	}
-	mm.activeMu.RUnlock()
-	mm.mappingMu.RUnlock()
-	if !bound {
-		return fmt.Errorf("signed Casimir mapping table binds no restored VMA")
+	if cursor < mm.layout.MaxAddr {
+		appendCasimirRegion(&out.Regions, pgalloc.CasimirRegion{
+			GuestStart: uint64(cursor), Length: uint64(mm.layout.MaxAddr - cursor),
+			State: casimirStateUnmapped,
+		})
 	}
+	if len(out.Regions) == 0 {
+		return pgalloc.CasimirAddressSpace{}, fmt.Errorf("address space has no canonical tiling")
+	}
+	return out, nil
+}
 
-	for _, action := range actions {
-		if action.unmap {
-			if err := mm.MUnmap(ctx, action.addr, action.length); err != nil {
-				return fmt.Errorf("unmap signed Casimir guard range %#x-%#x: %w", action.addr, action.addr+hostarch.Addr(action.length), err)
-			}
-			continue
-		}
-		if err := mm.MProtect(action.addr, action.length, action.protection, false); err != nil {
-			return fmt.Errorf("reapply signed Casimir protection at %#x-%#x: %w", action.addr, action.addr+hostarch.Addr(action.length), err)
-		}
+// RestoreCasimirMappings fails closed unless the restored authoritative VMA
+// graph is byte-for-byte equivalent to the signed LLML2 address space.
+func (mm *MemoryManager) RestoreCasimirMappings(ctx context.Context, signed pgalloc.CasimirAddressSpace) error {
+	got, err := mm.CaptureCasimirAddressSpace(ctx, signed.Identity)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(got, signed) {
+		return fmt.Errorf("restored VMA geometry differs from signed LLML2 authority")
 	}
 	return nil
 }
 
-func validateCasimirRegions(regions []pgalloc.CasimirRegion) error {
-	var next uint64
-	for _, region := range regions {
-		if region.GuestStart != next || region.Length == 0 ||
-			region.State < 1 || region.State > 3 ||
-			region.Protection&^uint8(7) != 0 ||
-			region.Flags&^uint8(3) != 0 ||
-			region.GuestStart > ^uint64(0)-region.Length {
-			return fmt.Errorf("invalid signed Casimir mapping at %#x", region.GuestStart)
+func mappingIdentity(v *vma, ctx context.Context) pgalloc.CasimirAuthorityID {
+	name := v.name
+	var device, inode uint64
+	if v.id != nil {
+		if name == "" {
+			name = v.id.MappedName(ctx)
 		}
-		next += region.Length
+		device = v.id.DeviceID()
+		inode = v.id.InodeID()
 	}
-	return nil
+	return sha256.Sum256([]byte(fmt.Sprintf("gvisor.mapping.v1:%T:%d:%d:%s", v.mappable, device, inode, name)))
 }
 
-func casimirRegionAt(regions []pgalloc.CasimirRegion, offset uint64) (pgalloc.CasimirRegion, bool) {
-	for _, region := range regions {
-		if region.GuestStart > offset {
-			break
-		}
-		if offset-region.GuestStart < region.Length {
-			return region, true
-		}
+func casimirProtection(at hostarch.AccessType) uint8 {
+	var out uint8
+	if at.Read {
+		out |= 1
 	}
-	return pgalloc.CasimirRegion{}, false
+	if at.Write {
+		out |= 2
+	}
+	if at.Execute {
+		out |= 4
+	}
+	return out
 }
 
-func casimirAccessType(protection uint8) hostarch.AccessType {
-	return hostarch.AccessType{
-		Read:    protection&casimirProtectionRead != 0,
-		Write:   protection&casimirProtectionWrite != 0,
-		Execute: protection&casimirProtectionExecute != 0,
+func appendCasimirRegion(regions *[]pgalloc.CasimirRegion, next pgalloc.CasimirRegion) {
+	if next.Length == 0 {
+		return
 	}
+	if n := len(*regions); n != 0 {
+		last := &(*regions)[n-1]
+		if last.GuestStart+last.Length == next.GuestStart &&
+			last.State == next.State && last.BackingKind == next.BackingKind &&
+			last.Backing == next.Backing && last.Protection == next.Protection &&
+			last.Flags == next.Flags &&
+			(last.State != casimirStateMappedData || last.ObjectOffset+last.Length == next.ObjectOffset) {
+			last.Length += next.Length
+			return
+		}
+	}
+	*regions = append(*regions, next)
 }
