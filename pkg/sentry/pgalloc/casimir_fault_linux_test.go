@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 	"unsafe"
@@ -108,10 +108,17 @@ func TestStartCasimirFaultsLabelsEPERMBoundaryAndClosesOpenedFD(t *testing.T) {
 }
 
 func TestConsumeCasimirMappingsRetainsExactSignedAttributes(t *testing.T) {
-	response := casimirFaultResponse{Regions: []CasimirRegion{
-		{GuestStart: 0, Length: 4096, State: 1, Protection: 3},
-		{GuestStart: 4096, Length: 4096, State: 2, Protection: 1, Flags: 2},
-		{GuestStart: 8192, Length: 4096, State: 3, Flags: 1},
+	backing := CasimirAuthorityID{1}
+	response := casimirFaultResponse{Layout: CasimirLayout{
+		Version: 2, PageSize: 4096,
+		AddressSpaces: []CasimirAddressSpace{{
+			Identity: CasimirAuthorityID{2}, MinAddr: 0x1000, MaxAddr: 0x4000,
+			Regions: []CasimirRegion{
+				{GuestStart: 0x1000, Length: 4096, State: 1, BackingKind: CasimirBackingBaseMemory, Backing: backing, ObjectOffset: 0, Protection: 3},
+				{GuestStart: 0x2000, Length: 4096, State: 2, Protection: 1, Flags: 2},
+				{GuestStart: 0x3000, Length: 4096, State: 3, Flags: 1},
+			},
+		}},
 	}}
 	client, server := net.Pipe()
 	defer client.Close()
@@ -131,40 +138,40 @@ func TestConsumeCasimirMappingsRetainsExactSignedAttributes(t *testing.T) {
 		_ = rw.Flush()
 	}()
 
-	regions, err := consumeCasimirMappings(
+	layout, err := consumeCasimirMappings(
 		bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client)),
 		12288,
 	)
 	if err != nil {
 		t.Fatalf("consumeCasimirMappings() error = %v", err)
 	}
-	if !slices.Equal(regions, response.Regions) {
-		t.Fatalf("consumeCasimirMappings() = %+v, want exact signed table %+v", regions, response.Regions)
+	if !reflect.DeepEqual(layout, response.Layout) {
+		t.Fatalf("consumeCasimirMappings() = %+v, want exact signed layout %+v", layout, response.Layout)
 	}
 }
 
 func TestConsumeCasimirMappingsRejectsUnknownAttributesAndOverflow(t *testing.T) {
 	tests := []struct {
-		name    string
-		regions []CasimirRegion
-		length  uint64
+		name   string
+		layout CasimirLayout
+		length uint64
 	}{
 		{
-			name:    "unknown protection",
-			regions: []CasimirRegion{{GuestStart: 0, Length: 4096, State: 1, Protection: 8}},
-			length:  4096,
+			name:   "unknown protection",
+			layout: CasimirLayout{Version: 2, PageSize: 4096, AddressSpaces: []CasimirAddressSpace{{MinAddr: 0, MaxAddr: 4096, Regions: []CasimirRegion{{Length: 4096, State: 1, BackingKind: CasimirBackingBaseMemory, Protection: 8}}}}},
+			length: 4096,
 		},
 		{
-			name:    "unknown flags",
-			regions: []CasimirRegion{{GuestStart: 0, Length: 4096, State: 1, Flags: 4}},
-			length:  4096,
+			name:   "unknown flags",
+			layout: CasimirLayout{Version: 2, PageSize: 4096, AddressSpaces: []CasimirAddressSpace{{MinAddr: 0, MaxAddr: 4096, Regions: []CasimirRegion{{Length: 4096, State: 1, BackingKind: CasimirBackingBaseMemory, Flags: 4}}}}},
+			length: 4096,
 		},
 		{
 			name: "overflow",
-			regions: []CasimirRegion{
+			layout: CasimirLayout{Version: 2, PageSize: 4096, AddressSpaces: []CasimirAddressSpace{{MinAddr: 0, MaxAddr: 1, Regions: []CasimirRegion{
 				{GuestStart: 0, Length: ^uint64(0), State: 1},
 				{GuestStart: ^uint64(0), Length: 1, State: 1},
-			},
+			}}}},
 			length: 1,
 		},
 	}
@@ -179,16 +186,16 @@ func TestConsumeCasimirMappingsRejectsUnknownAttributesAndOverflow(t *testing.T)
 				if err := json.NewDecoder(rw).Decode(&request); err != nil {
 					return
 				}
-				if err := json.NewEncoder(rw).Encode(casimirFaultResponse{Regions: test.regions}); err != nil {
+				if err := json.NewEncoder(rw).Encode(casimirFaultResponse{Layout: test.layout}); err != nil {
 					return
 				}
 				_ = rw.Flush()
 			}()
-			if regions, err := consumeCasimirMappings(
+			if layout, err := consumeCasimirMappings(
 				bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client)),
 				test.length,
-			); err == nil || len(regions) != 0 {
-				t.Fatalf("consumeCasimirMappings() = (%+v, %v), want fail-closed empty result", regions, err)
+			); err == nil || len(layout.AddressSpaces) != 0 {
+				t.Fatalf("consumeCasimirMappings() = (%+v, %v), want fail-closed empty result", layout, err)
 			}
 		})
 	}

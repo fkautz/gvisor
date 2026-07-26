@@ -15,13 +15,19 @@
 package kernel
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"slices"
 
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
@@ -32,28 +38,100 @@ import (
 	"gvisor.dev/gvisor/pkg/timing"
 )
 
-// RestoreCasimirMappings reconciles the complete signed LLIFS mapping table
-// with every distinct restored MemoryManager while all tasks remain stopped.
-func (k *Kernel) RestoreCasimirMappings(ctx context.Context, regions []pgalloc.CasimirRegion) error {
+// casimirAddressSpaces returns each distinct MemoryManager keyed by the
+// smallest root-namespace TID that references it. TIDs are checkpointed kernel
+// identity, so this remains stable across save and restore.
+func (k *Kernel) casimirAddressSpaces() (map[*mm.MemoryManager]pgalloc.CasimirAuthorityID, error) {
 	if k == nil || k.tasks == nil {
-		return fmt.Errorf("missing restored kernel for Casimir mappings")
+		return nil, fmt.Errorf("missing kernel for Casimir layout")
 	}
-	managers := make(map[*mm.MemoryManager]struct{})
+	minTID := make(map[*mm.MemoryManager]ThreadID)
 	k.tasks.mu.RLock()
-	for t := range k.tasks.Root.tids {
-		if manager := t.image.MemoryManager; manager != nil {
-			managers[manager] = struct{}{}
+	for t, tid := range k.tasks.Root.tids {
+		if manager := t.image.MemoryManager; manager != nil && (minTID[manager] == 0 || tid < minTID[manager]) {
+			minTID[manager] = tid
 		}
-		if state, ok := t.runState.(*runExecveAfterSiblingExitStop); ok && state.image != nil && state.image.MemoryManager != nil {
-			managers[state.image.MemoryManager] = struct{}{}
+		if state, ok := t.runState.(*runExecveAfterSiblingExitStop); ok && state.image != nil {
+			if manager := state.image.MemoryManager; manager != nil && (minTID[manager] == 0 || tid < minTID[manager]) {
+				minTID[manager] = tid
+			}
 		}
 	}
 	k.tasks.mu.RUnlock()
-	if len(managers) == 0 {
-		return fmt.Errorf("signed Casimir mappings found no restored address spaces")
+	out := make(map[*mm.MemoryManager]pgalloc.CasimirAuthorityID, len(minTID))
+	for manager, tid := range minTID {
+		var encoded [4]byte
+		binary.BigEndian.PutUint32(encoded[:], uint32(tid))
+		out[manager] = sha256.Sum256(append([]byte("gvisor.address-space.root-tid.v1\x00"), encoded[:]...))
 	}
-	for manager := range managers {
-		if err := manager.RestoreCasimirMappings(ctx, regions); err != nil {
+	if len(out) == 0 {
+		return nil, fmt.Errorf("Casimir layout found no address spaces")
+	}
+	return out, nil
+}
+
+// SaveCasimirLayout captures the authoritative VMA graph while tasks are
+// stopped and publishes a versioned sidecar before checkpoint state.
+func (k *Kernel) SaveCasimirLayout(ctx context.Context, w io.Writer) error {
+	managers, err := k.casimirAddressSpaces()
+	if err != nil {
+		return err
+	}
+	layout := pgalloc.CasimirLayout{Version: 2, PageSize: uint32(hostarch.PageSize)}
+	for manager, identity := range managers {
+		addressSpace, err := manager.CaptureCasimirAddressSpace(ctx, identity)
+		if err != nil {
+			return fmt.Errorf("capture Casimir address space: %w", err)
+		}
+		layout.AddressSpaces = append(layout.AddressSpaces, addressSpace)
+	}
+	slices.SortFunc(layout.AddressSpaces, func(a, b pgalloc.CasimirAddressSpace) int {
+		return bytes.Compare(a.Identity[:], b.Identity[:])
+	})
+	var encoded bytes.Buffer
+	if err := json.NewEncoder(&encoded).Encode(layout); err != nil {
+		return fmt.Errorf("write Casimir LLML2 sidecar: %w", err)
+	}
+	k.casimirLayoutDigest = sha256.Sum256(encoded.Bytes())
+	if _, err := w.Write(encoded.Bytes()); err != nil {
+		return fmt.Errorf("write Casimir LLML2 sidecar: %w", err)
+	}
+	return nil
+}
+
+// RestoreCasimirMappings reconciles the complete signed LLIFS mapping table
+// with every distinct restored MemoryManager while all tasks remain stopped.
+func (k *Kernel) RestoreCasimirMappings(ctx context.Context, layout pgalloc.CasimirLayout) error {
+	if layout.Version != 2 || layout.PageSize != uint32(hostarch.PageSize) {
+		return fmt.Errorf("unsupported signed Casimir layout version=%d page_size=%d", layout.Version, layout.PageSize)
+	}
+	var encoded bytes.Buffer
+	if err := json.NewEncoder(&encoded).Encode(layout); err != nil {
+		return fmt.Errorf("canonicalize signed Casimir layout: %w", err)
+	}
+	if got := sha256.Sum256(encoded.Bytes()); got != k.casimirLayoutDigest || got == ([sha256.Size]byte{}) {
+		return fmt.Errorf("signed Casimir layout differs from checkpoint-state commitment")
+	}
+	managers, err := k.casimirAddressSpaces()
+	if err != nil {
+		return err
+	}
+	signed := make(map[pgalloc.CasimirAuthorityID]pgalloc.CasimirAddressSpace, len(layout.AddressSpaces))
+	for _, addressSpace := range layout.AddressSpaces {
+		if _, exists := signed[addressSpace.Identity]; exists {
+			return fmt.Errorf("duplicate signed Casimir address-space identity")
+		}
+		signed[addressSpace.Identity] = addressSpace
+	}
+	if len(signed) != len(managers) {
+		return fmt.Errorf("signed Casimir layout has %d address spaces, restored kernel has %d", len(signed), len(managers))
+	}
+	for manager, identity := range managers {
+		addressSpace, ok := signed[identity]
+		if !ok {
+			return fmt.Errorf("restored address space lacks signed Casimir identity")
+		}
+		if err := manager.RestoreCasimirMappings(ctx, addressSpace); err != nil {
 			return fmt.Errorf("restore signed Casimir address space: %w", err)
 		}
 	}
