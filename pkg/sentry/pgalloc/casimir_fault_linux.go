@@ -213,11 +213,11 @@ func resolveCasimirFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode s
 	switch action {
 	case "wake":
 		// Casimir has already materialized the verified page into the shared
-		// shmem page cache. Complete the fault with UFFDIO_CONTINUE directly;
-		// UFFDIO_WAKE does not resolve this registered missing fault and is
-		// rejected by the kernel on the real restore path.
-		if err := wakeup.continueFault(pageStart, pageSize); err != nil {
-			return "", fmt.Errorf("continue Casimir published page: %w", err)
+		// shmem page cache. Wake the registered MISSING fault so that it
+		// retries against that page; the exact retry is then authorized as a
+		// resident MINOR continuation by casimirFaultTransitions.
+		if err := wakeup.wakeFault(pageStart, pageSize); err != nil {
+			return "", fmt.Errorf("wake Casimir published page: %w", err)
 		}
 	case "continue":
 		if err := wakeup.continueFault(pageStart, pageSize); err != nil {
