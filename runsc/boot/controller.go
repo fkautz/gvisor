@@ -262,12 +262,12 @@ func (c *controller) registerHandlers() {
 	}
 }
 
-// refreshHandlersAfterFork resets the server, re-registers all handlers using
-// l, and recreates the accept loop that does not survive the restore fork.
-func (c *controller) refreshHandlersAfterFork() {
+// refreshHandlersAfterRestore resets the server, re-registers all handlers
+// using l, and adds a fresh post-restore accept loop.
+func (c *controller) refreshHandlersAfterRestore() {
 	c.srv.ResetServer()
 	c.registerHandlers()
-	c.srv.RestartServingAfterFork()
+	c.srv.StartServingAfterRestore()
 }
 
 func (c *controller) stop() {

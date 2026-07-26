@@ -572,9 +572,9 @@ func (r *restorer) restore(l *Loader) error {
 	l.k.SetSaver(l)
 	l.createRemappedNvproxyDeviceFiles(ctx)
 
-	// Refresh the control server with the newly created kernel. The listening
-	// socket survives the restore fork, but its accept goroutine does not.
-	l.ctrl.refreshHandlersAfterFork()
+	// Refresh the control server with the newly created kernel and ensure a
+	// fresh acceptor is available after the restore transition.
+	l.ctrl.refreshHandlersAfterRestore()
 
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()

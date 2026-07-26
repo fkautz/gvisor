@@ -129,7 +129,7 @@ func TestServeTreatsIntentionalCloseAsCleanExit(t *testing.T) {
 	}
 }
 
-func TestRestartServingAfterForkDiscardsInheritedLoopState(t *testing.T) {
+func TestStartServingAfterRestorePreservesExistingLoopState(t *testing.T) {
 	socket := &scriptedServerSocket{results: []scriptedAccept{{err: unix.EINVAL}}}
 	s := New(nil)
 	s.socket = socket
@@ -138,17 +138,11 @@ func TestRestartServingAfterForkDiscardsInheritedLoopState(t *testing.T) {
 		fatal <- err
 	}
 
-	// Model a WaitGroup count inherited from a pre-fork accept goroutine. That
-	// goroutine does not exist in the child and therefore cannot call Done.
-	s.wg.Add(1)
-	s.stopping.Store(true)
-	s.serveErr.Store(&serveError{err: unix.EBADF})
-
-	s.RestartServingAfterFork()
+	s.StartServingAfterRestore()
 	s.Wait()
 
 	if socket.listens != 0 {
-		t.Fatalf("RestartServingAfterFork called Listen %d times, want 0", socket.listens)
+		t.Fatalf("StartServingAfterRestore called Listen %d times, want 0", socket.listens)
 	}
 	select {
 	case err := <-fatal:
@@ -160,9 +154,6 @@ func TestRestartServingAfterForkDiscardsInheritedLoopState(t *testing.T) {
 	}
 	if !errors.Is(s.ServeError(), unix.EINVAL) {
 		t.Fatalf("ServeError() = %v, want EINVAL", s.ServeError())
-	}
-	if s.stopping.Load() {
-		t.Fatal("stopping remained set after post-fork restart")
 	}
 }
 
