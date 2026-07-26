@@ -29,6 +29,7 @@ import (
 type scriptedServerSocket struct {
 	results []scriptedAccept
 	calls   int
+	listens int
 }
 
 type scriptedAccept struct {
@@ -36,9 +37,12 @@ type scriptedAccept struct {
 	err  error
 }
 
-func (*scriptedServerSocket) FD() int       { return -1 }
-func (*scriptedServerSocket) Listen() error { return nil }
-func (*scriptedServerSocket) Close() error  { return nil }
+func (*scriptedServerSocket) FD() int { return -1 }
+func (s *scriptedServerSocket) Listen() error {
+	s.listens++
+	return nil
+}
+func (*scriptedServerSocket) Close() error { return nil }
 
 func (s *scriptedServerSocket) Accept() (*unet.Socket, error) {
 	if s.calls >= len(s.results) {
@@ -122,6 +126,43 @@ func TestServeTreatsIntentionalCloseAsCleanExit(t *testing.T) {
 	}
 	if err := s.ServeError(); err != nil {
 		t.Fatalf("ServeError() = %v, want nil", err)
+	}
+}
+
+func TestRestartServingAfterForkDiscardsInheritedLoopState(t *testing.T) {
+	socket := &scriptedServerSocket{results: []scriptedAccept{{err: unix.EINVAL}}}
+	s := New(nil)
+	s.socket = socket
+	fatal := make(chan error, 1)
+	s.fatalExit = func(err error) {
+		fatal <- err
+	}
+
+	// Model a WaitGroup count inherited from a pre-fork accept goroutine. That
+	// goroutine does not exist in the child and therefore cannot call Done.
+	s.wg.Add(1)
+	s.stopping.Store(true)
+	s.serveErr.Store(&serveError{err: unix.EBADF})
+
+	s.RestartServingAfterFork()
+	s.Wait()
+
+	if socket.listens != 0 {
+		t.Fatalf("RestartServingAfterFork called Listen %d times, want 0", socket.listens)
+	}
+	select {
+	case err := <-fatal:
+		if !errors.Is(err, unix.EINVAL) {
+			t.Fatalf("fatal exit error = %v, want EINVAL", err)
+		}
+	default:
+		t.Fatal("restarted accept loop did not run")
+	}
+	if !errors.Is(s.ServeError(), unix.EINVAL) {
+		t.Fatalf("ServeError() = %v, want EINVAL", s.ServeError())
+	}
+	if s.stopping.Load() {
+		t.Fatal("stopping remained set after post-fork restart")
 	}
 }
 

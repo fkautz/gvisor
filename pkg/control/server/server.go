@@ -131,6 +131,24 @@ func (s *Server) StartServing() error {
 		return err
 	}
 
+	s.startServingLoop()
+	return nil
+}
+
+// RestartServingAfterFork restarts the accept loop in a post-fork child.
+//
+// The control socket remains open and listening across the restore fork, but
+// goroutines other than the one that called fork do not survive in the child.
+// Consequently, the inherited WaitGroup count and accept loop no longer
+// describe live work. This method must only be called in the post-fork child.
+func (s *Server) RestartServingAfterFork() {
+	s.wg = sync.WaitGroup{}
+	s.stopping.Store(false)
+	s.serveErr.Store(nil)
+	s.startServingLoop()
+}
+
+func (s *Server) startServingLoop() {
 	ready := make(chan struct{})
 	s.wg.Add(1)
 	go func() { // S/R-SAFE: does not impact state directly.
@@ -141,8 +159,6 @@ func (s *Server) StartServing() error {
 		}
 	}()
 	<-ready
-
-	return nil
 }
 
 // serve is the body of the main service goroutine. It handles incoming control
