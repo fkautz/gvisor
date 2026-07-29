@@ -11,6 +11,7 @@ go_library(
         "network.go",
         "network_unsafe.go",
         "no_xdp.go",
+        "runtime_native_checkpoint.go",
         "sandbox.go",
         "xdp.go",
     ],
@@ -79,14 +80,33 @@ go_test(
     name = "sandbox_test",
     size = "small",
     srcs = [
+        "checkpoint_plane_wiring_test.go",
         "network_test.go",
     ],
     library = ":sandbox",
     deps = [
+        "//pkg/sentry/control",
+        "//pkg/sentry/state/checkpointfiles",
+        "//pkg/state/statefile",
         "//runsc/boot",
         "//runsc/config",
+        "//runsc/donation",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@com_github_vishvananda_netlink//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "runtime_native_checkpoint_test",
+    size = "small",
+    srcs = [
+        "runtime_native_checkpoint.go",
+        "runtime_native_checkpoint_test.go",
+    ],
+    deps = [
+        "//pkg/sentry/state/checkpointfiles",
+        "//pkg/state/statefile",
     ],
 )
 

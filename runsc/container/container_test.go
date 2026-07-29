@@ -1341,6 +1341,14 @@ func TestCheckpointRestore(t *testing.T) {
 	}
 }
 
+// TestRuntimeNativeCheckpointSandboxBoundary is the focused production gate
+// for Sandbox.Checkpoint -> control.State.Save -> Kernel.SaveTo and
+// Sandbox.Restore. It intentionally runs both uncompressed and compressed
+// checkpoint variants through the canonical end-to-end test above.
+func TestRuntimeNativeCheckpointSandboxBoundary(t *testing.T) {
+	TestCheckpointRestore(t)
+}
+
 // TestCheckpointRestoreHostname verifies that hostname is updated on restore
 // if it was not changed inside the container, and is NOT updated if it was changed.
 func TestCheckpointRestoreHostname(t *testing.T) {

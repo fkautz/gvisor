@@ -81,11 +81,19 @@ go_library(
 go_test(
     name = "control_test",
     size = "small",
-    srcs = ["proc_test.go"],
+    srcs = [
+        "proc_test.go",
+        "state_checkpoint_test.go",
+    ],
     library = ":control",
     deps = [
         "//pkg/log",
+        "//pkg/sentry/state/checkpointfiles",
+        "//pkg/sentry/state/stateio",
+        "//pkg/sentry/state/stateipc",
         "//pkg/sentry/ktime",
         "//pkg/sentry/usage",
+        "//pkg/unet",
+        "//pkg/urpc",
     ],
 )

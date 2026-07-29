@@ -72,3 +72,20 @@ func TestBufWriter(t *testing.T) {
 		}
 	}
 }
+
+func TestBufWriterAbortDoesNotFinalizeBufferedBytes(t *testing.T) {
+	var destination bytes.Buffer
+	w, err := NewBufWriter(NewIOWriter(&destination, 4096, 1, 1), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("uncommitted-generation")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if destination.Len() != 0 {
+		t.Fatalf("Abort published %q", destination.Bytes())
+	}
+}

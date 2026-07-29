@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -151,17 +152,21 @@ func (l *Loader) SaveAsync() (err error) {
 
 	o, err := saveOptsFromSpec(l.root.spec, l.saveFDs, l.saveCheckpointGofer)
 	if err != nil {
-		return err
+		saveFDs := l.saveFDs
+		publishDir := l.savePublishDir
+		l.saveFDs = nil
+		l.savePublishDir = nil
+		return finishConfiguredSave(saveFDs, publishDir, err)
 	}
-	// Close all FDs and set saveFDs to nil to mark that save has already
-	// been triggered. So further attempts to save won't reuse and corrupt the files.
-	for _, fd := range l.saveFDs {
-		_ = fd.Close()
-	}
+	saveFDs := l.saveFDs
+	publishDir := l.savePublishDir
+	// Clear configured FDs before starting the save so further attempts cannot
+	// reuse and corrupt this transaction.
 	l.saveFDs = nil
+	l.savePublishDir = nil
 
 	go func() {
-		_ = l.save(o)
+		_ = l.saveConfigured(o, saveFDs, publishDir)
 	}()
 	// Loader.save() takes over the responsibility of calling OnCheckpointAttempt() when
 	// it completes.
@@ -170,11 +175,21 @@ func (l *Loader) SaveAsync() (err error) {
 	return nil
 }
 
-// saveOptsFromSpec returns the saveOpts based on annotations from the spec. `fds` are
-// no longer needed and can be closed after this is called.
-func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (*control.SaveOpts, error) {
+// saveOptsFromSpec returns save options based on annotations from the spec.
+// The returned options use duplicates of fds; local transaction publication
+// retains the originals through its final fsync and directory commit.
+func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (_ *control.SaveOpts, retErr error) {
 	// Convert the FDs to files which is required by the saveOpts.
 	files := make([]*os.File, len(fds))
+	defer func() {
+		if retErr != nil {
+			for _, file := range files {
+				if file != nil {
+					_ = file.Close()
+				}
+			}
+		}
+	}()
 	for i, fd := range fds {
 		var err error
 		files[i], err = fd.File()
@@ -194,7 +209,7 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 			Files: files,
 		},
 		Metadata:                 comp.ToMetadata(),
-		HavePagesFile:            len(files) > 1,
+		HavePagesFile:            true,
 		Resume:                   specutils.AnnotationToBool(spec, annotationCheckpointResume),
 		CudaCheckpointSequential: specutils.AnnotationToBool(spec, annotationCheckpointCudaCheckpointSequential),
 	}
@@ -203,8 +218,20 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	}
 	if useCheckpointGofer {
 		saveOpts.UseCheckpointGofer = true
-		if comp == statefile.CompressionLevelNone {
-			saveOpts.HavePagesFile = true
+		generation, err := checkpointfiles.NewGeneration()
+		if err != nil {
+			return nil, err
+		}
+		saveOpts.CheckpointGeneration = generation
+	} else {
+		switch len(files) {
+		case 3:
+		case 5:
+			// A shared base is inseparable from its authoritative LLML2
+			// geometry sidecar in the combined checkpoint lineage.
+			saveOpts.SharedBase = true
+		default:
+			return nil, fmt.Errorf("local workload checkpoint got %d files, want runtime, metadata, pages, or those planes plus base and Casimir layout", len(files))
 		}
 	}
 
@@ -679,8 +706,42 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }
 
+func (l *Loader) saveConfigured(o *control.SaveOpts, files []*fd.FD, publishDir *fd.FD) (err error) {
+	saveOpts, err := control.ConvertToStateSaveOpts(o)
+	if err != nil {
+		return finishConfiguredSave(files, publishDir, err)
+	}
+	defer saveOpts.Close()
+	return l.saveWithOptsAndFinalize(saveOpts, &o.ExecOpts, func(saveErr error) error {
+		return finishConfiguredSave(files, publishDir, saveErr)
+	})
+}
+
+func finishConfiguredSave(files []*fd.FD, publishDir *fd.FD, saveErr error) error {
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+		if publishDir != nil {
+			_ = publishDir.Close()
+		}
+	}()
+	if publishDir == nil || publishDir.FD() < 0 {
+		return saveErr
+	}
+	planeFDs := make([]int, len(files))
+	for i, file := range files {
+		planeFDs[i] = file.FD()
+	}
+	return checkpointfiles.FinishLocalTransaction(publishDir.FD(), planeFDs, saveErr)
+}
+
 // saveWithOpts saves the kernel with the given options.
 func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
+	return l.saveWithOptsAndFinalize(saveOpts, execOpts, nil)
+}
+
+func (l *Loader) saveWithOptsAndFinalize(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts, finalize func(error) error) (err error) {
 	defer func() {
 		// This closure is required to capture the final value of err.
 		l.k.OnCheckpointAttempt(err)
@@ -717,7 +778,11 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 		Kernel:   l.k,
 		Watchdog: l.watchdog,
 	}
-	return state.SaveWithOpts(saveOpts, execOpts)
+	err = state.SaveWithOpts(saveOpts, execOpts)
+	if finalize != nil {
+		err = finalize(err)
+	}
+	return err
 }
 
 func procFiles(conf *config.Config) []string {

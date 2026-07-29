@@ -302,6 +302,10 @@ type Loader struct {
 	// is a socket connected to a checkpoint gofer.
 	saveCheckpointGofer bool
 
+	// savePublishDir is the local checkpoint directory containing fixed
+	// producer-owned staging entries.
+	savePublishDir *fd.FD
+
 	// restoreErr is the error that occurred during restore.
 	//
 	// +checklocks:mu
@@ -435,6 +439,11 @@ type Args struct {
 	// If SaveCheckpointGofer is true, Args.SaveFDs contains only one FD, which
 	// is a socket connected to a checkpoint gofer.
 	SaveCheckpointGofer bool
+	// SavePublishDirFD is the directory containing producer-owned local
+	// checkpoint staging entries, or -1 for checkpoint-gofer saves.
+	SavePublishDirFD int
+	// HaveSavePublishDir indicates that SavePublishDirFD is valid.
+	HaveSavePublishDir bool
 	// FSRestoreFDs are FDs used for filesystem checkpoint restore.
 	FSRestoreFDs []*fd.FD
 	// If FSRestoreCheckpointGofer is true, Args.FSRestoreFDs contains only one
@@ -525,6 +534,10 @@ func New(args Args) (*Loader, error) {
 	}
 
 	eid := execID{cid: args.ID}
+	var savePublishDir *fd.FD
+	if args.HaveSavePublishDir {
+		savePublishDir = fd.New(args.SavePublishDirFD)
+	}
 	l := &Loader{
 		sandboxID:             args.ID,
 		processes:             map[execID]*execProcess{eid: {}},
@@ -539,6 +552,7 @@ func New(args Args) (*Loader, error) {
 		failedToStart:         make(map[string]struct{}),
 		saveFDs:               args.SaveFDs,
 		saveCheckpointGofer:   args.SaveCheckpointGofer,
+		savePublishDir:        savePublishDir,
 		fsSaveFDs:             args.FSSaveFDs,
 		fsSaveCheckpointGofer: args.FSSaveCheckpointGofer,
 	}
@@ -797,7 +811,9 @@ func New(args Args) (*Loader, error) {
 	}
 
 	if len(args.Conf.TestOnlyAutosaveImagePath) != 0 {
-		enableAutosave(l, args.Conf.TestOnlyAutosaveResume, l.saveFDs)
+		if err := enableAutosave(l, args.Conf.TestOnlyAutosaveResume, l.saveFDs); err != nil {
+			return nil, fmt.Errorf("enabling test autosave: %w", err)
+		}
 	}
 
 	metric.SentryEntryPointMetric.Increment(&metric.EntryPointTypeRunsc)
@@ -872,6 +888,12 @@ func (l *Loader) Destroy() {
 		l.stopSignalForwarding()
 	}
 	l.watchdog.Stop()
+	for _, file := range l.saveFDs {
+		_ = file.Close()
+	}
+	if l.savePublishDir != nil {
+		_ = l.savePublishDir.Close()
+	}
 
 	ctx := l.k.SupervisorContext()
 	l.mu.Lock()
