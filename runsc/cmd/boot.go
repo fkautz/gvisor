@@ -161,6 +161,7 @@ type Boot struct {
 
 	saveFDs             sandboxsetup.IntFlags
 	saveCheckpointGofer bool
+	savePublishDirFD    int
 
 	fsSaveFDs             sandboxsetup.IntFlags
 	fsSaveCheckpointGofer bool
@@ -278,6 +279,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
 	f.Var(&b.saveFDs, "save-fds", "ordered list of file descriptors to be used save checkpoints. Order: kernel state, page metadata, page file")
 	f.BoolVar(&b.saveCheckpointGofer, "save-checkpoint-gofer", false, "if true, -save-fds is a socket connected to checkpoint gofer")
+	f.IntVar(&b.savePublishDirFD, "save-publish-dir-fd", -1, "directory FD used to atomically publish a local workload-trigger or test autosave checkpoint")
 	f.Var(&b.fsSaveFDs, "fs-save-fds", "ordered list of file descriptors for filesystem checkpoint save")
 	f.BoolVar(&b.fsSaveCheckpointGofer, "fs-save-checkpoint-gofer", false, "if true, -fs-save-fds is a socket connected to checkpoint gofer")
 	f.Var(&b.fsRestoreFDs, "fs-restore-fds", "ordered list of file descriptors for filesystem checkpoint restore")
@@ -614,6 +616,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		HostTHP:                  b.hostTHP,
 		SaveFDs:                  b.saveFDs.GetFDs(),
 		SaveCheckpointGofer:      b.saveCheckpointGofer,
+		SavePublishDirFD:         b.savePublishDirFD,
+		HaveSavePublishDir:       b.savePublishDirFD >= 0,
 		FSSaveFDs:                b.fsSaveFDs.GetFDs(),
 		FSSaveCheckpointGofer:    b.fsSaveCheckpointGofer,
 		FSRestoreFDs:             b.fsRestoreFDs.GetFDs(),

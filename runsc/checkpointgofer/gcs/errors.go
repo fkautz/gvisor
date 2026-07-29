@@ -27,6 +27,9 @@ import (
 // HTTP status codes returned by GCS:
 // https://cloud.google.com/storage/docs/json_api/v1/status-codes#standardcodes
 const (
+	// statusNotFound is returned when the requested object does not exist.
+	statusNotFound = 404
+
 	// statusForbidden is returned by the storage API due to various
 	// authorization failures.
 	statusForbidden = 403

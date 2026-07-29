@@ -208,6 +208,7 @@ go_test(
     srcs = [
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
+        "runtime_native_checkpoint_test.go",
         "sharedbase_test.go",
         "saverestore_test.go",
         "flatten_test.go",

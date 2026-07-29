@@ -3503,8 +3503,9 @@ func TestCheckpointRestoreAnnotation(t *testing.T) {
 	// but don't expose procfs files.
 	testSpecs[0].Annotations["dev.gvisor.internal.checkpoint.path"] = dir
 	testSpecs[0].Annotations["dev.gvisor.internal.checkpoint.resume"] = "true"
-	// Use compression=none to force the creation of multiple files.
-	testSpecs[0].Annotations["dev.gvisor.internal.checkpoint.compression"] = "none"
+	// Exercise the workload-trigger path with compression enabled. Runtime
+	// state and MemoryFile bytes must remain structurally separated.
+	testSpecs[0].Annotations["dev.gvisor.internal.checkpoint.compression"] = string(statefile.CompressionLevelFlateBestSpeed)
 
 	// Expose procfs files in the second container.
 	testSpecs[1].Annotations["dev.gvisor.internal.checkpoint.enable"] = "true"

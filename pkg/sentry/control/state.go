@@ -106,6 +106,11 @@ type SaveOpts struct {
 	// stateipc.AsyncFileServer and providing checkpoint files.
 	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
 
+	// CheckpointGeneration, when non-empty, selects generation-scoped
+	// checkpoint-gofer objects and a commit marker published after all planes
+	// finalize successfully.
+	CheckpointGeneration string `json:"checkpoint_generation"`
+
 	// CudaCheckpointPath is the path to the cuda-checkpoint binary.
 	CudaCheckpointPath string `json:"cuda_checkpoint_path"`
 
@@ -220,7 +225,12 @@ func setSaveOptsForCheckpointGofer(o *SaveOpts, saveOpts *state.SaveOpts) error 
 	}
 	defer afc.DecRef()
 
-	stateFileAsync, err := afc.OpenWrite(checkpointfiles.StateFileName)
+	stateFileName, pagesMetadataFileName, pagesFileName, err := checkpointfiles.FullCheckpointFileNames(o.CheckpointGeneration)
+	if err != nil {
+		return err
+	}
+
+	stateFileAsync, err := afc.OpenWrite(stateFileName)
 	if err != nil {
 		return fmt.Errorf("failed to open state file: %w", err)
 	}
@@ -231,7 +241,7 @@ func setSaveOptsForCheckpointGofer(o *SaveOpts, saveOpts *state.SaveOpts) error 
 		return fmt.Errorf("failed to buffer state file: %w", err)
 	}
 	if o.HavePagesFile {
-		pagesMetadataAsync, err := afc.OpenWrite(checkpointfiles.PagesMetadataFileName)
+		pagesMetadataAsync, err := afc.OpenWrite(pagesMetadataFileName)
 		if err != nil {
 			return fmt.Errorf("failed to open pages metadata file: %w", err)
 		}
@@ -239,10 +249,25 @@ func setSaveOptsForCheckpointGofer(o *SaveOpts, saveOpts *state.SaveOpts) error 
 		if err != nil {
 			return fmt.Errorf("failed to buffer pages metadata file: %w", err)
 		}
-		saveOpts.PagesFile, err = afc.OpenWrite(checkpointfiles.PagesFileName)
+		saveOpts.PagesFile, err = afc.OpenWrite(pagesFileName)
 		if err != nil {
 			return fmt.Errorf("failed to open pages file: %w", err)
 		}
+	}
+	if o.CheckpointGeneration != "" {
+		commitAsync, err := afc.OpenWrite(checkpointfiles.CommitFileName)
+		if err != nil {
+			return fmt.Errorf("failed to open checkpoint commit marker: %w", err)
+		}
+		commit, err := stateio.NewBufWriter(commitAsync /* transfers ownership */, 4096)
+		if err != nil {
+			return fmt.Errorf("failed to buffer checkpoint commit marker: %w", err)
+		}
+		if _, err := commit.Write([]byte(o.CheckpointGeneration)); err != nil {
+			commit.Abort()
+			return fmt.Errorf("failed to write checkpoint commit marker: %w", err)
+		}
+		saveOpts.CheckpointCommit = commit
 	}
 	return nil
 }

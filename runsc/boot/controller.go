@@ -772,7 +772,28 @@ func getRestoreReadersForCheckpointGofer(o *RestoreOpts) (io.ReadCloser, io.Read
 	}
 	defer afc.DecRef()
 
-	stateFileAsync, err := afc.OpenRead(checkpointfiles.StateFileName)
+	generation, err := checkpointfiles.ReadCommittedGeneration(func() (io.ReadCloser, error) {
+		commitAsync, err := afc.OpenRead(checkpointfiles.CommitFileName)
+		if err != nil {
+			return nil, err
+		}
+		return stateio.NewBufReader(commitAsync /* transfers ownership */, 4096)
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if generation == "" {
+		// Checkpoints created before generation transactions have no commit
+		// marker and retain their exact legacy object names.
+		log.Infof("Checkpoint commit marker absent, using legacy checkpoint object names")
+	}
+
+	stateFileName, pagesMetadataFileName, pagesFileName, err := checkpointfiles.FullCheckpointFileNames(generation)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	stateFileAsync, err := afc.OpenRead(stateFileName)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to open state file: %w", err)
 	}
@@ -781,8 +802,12 @@ func getRestoreReadersForCheckpointGofer(o *RestoreOpts) (io.ReadCloser, io.Read
 		return nil, nil, nil, fmt.Errorf("failed to buffer state file: %w", err)
 	}
 
-	pagesMetadataAsync, err := afc.OpenRead(checkpointfiles.PagesMetadataFileName)
+	pagesMetadataAsync, err := afc.OpenRead(pagesMetadataFileName)
 	if err != nil {
+		if generation != "" {
+			stateFile.Close()
+			return nil, nil, nil, fmt.Errorf("failed to open committed pages metadata file: %w", err)
+		}
 		// This might be fs.ErrNotExist or unix.ENOENT, but this detail is lost
 		// by URPC (which only preserves the error string), so log and continue
 		// under the assumption that it is.
@@ -795,7 +820,7 @@ func getRestoreReadersForCheckpointGofer(o *RestoreOpts) (io.ReadCloser, io.Read
 		stateFile.Close()
 		return nil, nil, nil, fmt.Errorf("failed to buffer pages metadata file: %w", err)
 	}
-	pagesFile, err := afc.OpenRead(checkpointfiles.PagesFileName)
+	pagesFile, err := afc.OpenRead(pagesFileName)
 	if err != nil {
 		pagesMetadata.Close()
 		stateFile.Close()

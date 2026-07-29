@@ -1082,11 +1082,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donations.DonateAndClose("sink-fds", args.SinkFiles...)
 
 	if len(conf.TestOnlyAutosaveImagePath) != 0 {
-		files, err := createSaveFiles(conf.TestOnlyAutosaveImagePath, false, statefile.CompressionLevelFlateBestSpeed)
-		if err != nil {
+		if err := configureTestAutosaveDonations(conf, &donations); err != nil {
 			return fmt.Errorf("failed to create auto save files: %w", err)
 		}
-		donations.DonateAndClose("save-fds", files...)
 	}
 
 	if args.FSRestoreImagePath != "" {
@@ -1457,6 +1455,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	return nil
 }
 
+func configureTestAutosaveDonations(conf *config.Config, donations *donation.Agency) error {
+	return donateLocalRuntimeNativeCheckpoint(conf.TestOnlyAutosaveImagePath, false, false, donations)
+}
+
 func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
 	for _, idMap := range IDMap {
 		if idMap.ContainerID == 0 {
@@ -1709,21 +1711,39 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 			_ = f.Close()
 		}
 	}()
-	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, &opt); err != nil {
+	output, err := s.setCheckpointOptsFiles(conf, imagePath, opts, &opt)
+	if err != nil {
 		return err
+	}
+	if output != nil {
+		defer output.abort()
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
+		if output != nil {
+			return errors.Join(
+				fmt.Errorf("checkpointing container %q: %w", cid, err),
+				output.abort(),
+			)
+		}
 		return fmt.Errorf("checkpointing container %q: %w", cid, err)
+	}
+	if output != nil {
+		if err := output.publish(); err != nil {
+			return errors.Join(
+				fmt.Errorf("publishing checkpoint for container %q: %w", cid, err),
+				output.abort(),
+			)
+		}
 	}
 	s.Checkpointed = true
 	return nil
 }
 
-func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
+func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) (*runtimeNativeCheckpointOutput, error) {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-writes")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if clientSockFile == nil {
 		return setCheckpointOptsFilesForLocalCheckpoint(conf, imagePath, opts, opt)
@@ -1731,69 +1751,52 @@ func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, 
 	log.Infof("Saving to GCS via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
 	opt.UseCheckpointGofer = true
-	opt.HavePagesFile = opts.Compression == statefile.CompressionLevelNone
-	return nil
+	// Plane membership belongs to the checkpoint producer, not to compression
+	// policy. Always provide MemoryFile streams so pages cannot enter the
+	// opaque runtime-native stream.
+	if err := configureRuntimeNativeCheckpointGofer(opt); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
-func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
-	files, err := createSaveFiles(imagePath, opts.Direct, opts.Compression)
+func configureRuntimeNativeCheckpointGofer(opt *control.SaveOpts) error {
+	opt.HavePagesFile = true
+	generation, err := checkpointfiles.NewGeneration()
 	if err != nil {
 		return err
 	}
-	opt.FilePayload.Files = files
-	opt.HavePagesFile = len(files) > 1
-	// GVISOR-3 (C1b): add a base.img output so the sentry exports the shared base
-	// and saves a delta-only checkpoint against it.
-	if opts.SharedBase && opt.HavePagesFile {
-		basePath := filepath.Join(imagePath, "base.img")
-		bf, err := os.OpenFile(basePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
-		if err != nil {
-			return fmt.Errorf("creating base image %q: %w", basePath, err)
-		}
-		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
-		opt.SharedBase = true
-	}
+	opt.CheckpointGeneration = generation
 	return nil
 }
-
-// createSaveFiles creates the files used by checkpoint to save the state. They are returned in
-// the following order: sentry state, page metadata, page file. This is the same order expected by
-// RPCs and argument passing to the sandbox.
-func createSaveFiles(path string, direct bool, compression statefile.CompressionLevel) ([]*os.File, error) {
-	var files []*os.File
-
-	stateFilePath := filepath.Join(path, checkpointfiles.StateFileName)
-	f, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) (*runtimeNativeCheckpointOutput, error) {
+	output, err := newRuntimeNativeCheckpointOutput(imagePath, opts.Direct, opts.SharedBase)
 	if err != nil {
-		return nil, fmt.Errorf("creating checkpoint state file %q: %w", stateFilePath, err)
+		return nil, err
 	}
-	files = append(files, f)
+	opt.FilePayload.Files = output.files
+	opt.HavePagesFile = true
+	opt.SharedBase = opts.SharedBase
+	return output, nil
+}
 
-	// When there is no compression, MemoryFile contents are page-aligned.
-	// It is beneficial to store them separately so certain optimizations can be
-	// applied during restore. See Restore().
-	if compression == statefile.CompressionLevelNone {
-		pagesMetadataFilePath := filepath.Join(path, checkpointfiles.PagesMetadataFileName)
-		f, err = os.OpenFile(pagesMetadataFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
-		}
-		files = append(files, f)
-
-		pagesFilePath := filepath.Join(path, checkpointfiles.PagesFileName)
-		pagesWriteFlags := os.O_CREATE | os.O_EXCL | os.O_RDWR
-		if direct {
-			// The writes will be page-aligned, so it can be opened with O_DIRECT.
-			pagesWriteFlags |= syscall.O_DIRECT
-		}
-		f, err := os.OpenFile(pagesFilePath, pagesWriteFlags, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
-		}
-		files = append(files, f)
+func donateLocalRuntimeNativeCheckpoint(path string, direct, sharedBase bool, donations *donation.Agency) (retErr error) {
+	output, err := newRuntimeNativeCheckpointOutput(path, direct, sharedBase)
+	if err != nil {
+		return err
 	}
-
-	return files, nil
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, output.abort())
+		}
+	}()
+	dir, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening checkpoint publication directory: %w", err)
+	}
+	donations.DonateAndClose("save-fds", output.files...)
+	donations.DonateAndClose("save-publish-dir-fd", dir)
+	return nil
 }
 
 func (s *Sandbox) openFSRestoreFiles(conf *config.Config, imagePath string, direct bool, cmd *exec.Cmd) ([]*os.File, error) {
@@ -2036,8 +2039,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 		return nil
 	}
 
-	comp, err := boot.GetAnnotationCheckpointCompression(args.Spec)
-	if err != nil {
+	if _, err := boot.GetAnnotationCheckpointCompression(args.Spec); err != nil {
 		return err
 	}
 	direct := boot.GetAnnotationCheckpointDirect(args.Spec)
@@ -2051,11 +2053,9 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 		cmd.Args = append(cmd.Args, "-save-checkpoint-gofer")
 		log.Infof("Enabling workload-trigger saving to GCS via checkpoint gofer")
 	} else {
-		files, err := createSaveFiles(path, direct, comp)
-		if err != nil {
+		if err := donateLocalRuntimeNativeCheckpoint(path, direct, false, donations); err != nil {
 			return fmt.Errorf("failed to create auto save files: %w", err)
 		}
-		donations.DonateAndClose("save-fds", files...)
 	}
 
 	return nil

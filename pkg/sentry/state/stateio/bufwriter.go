@@ -147,6 +147,13 @@ func (w *BufWriter) Close() error {
 	return errors.Join(waitErr, finalizeErr)
 }
 
+// Abort closes the underlying writer without flushing buffered bytes or
+// finalizing the destination. Abort must be used instead of Close when the
+// buffered object is a publication marker for a failed transaction.
+func (w *BufWriter) Abort() error {
+	return errors.Join(w.aw.Close(), unix.Munmap(w.buf))
+}
+
 // Write implements io.Writer.Write.
 func (w *BufWriter) Write(src []byte) (int, error) {
 	// If w.aw.Wait() or any previous write has returned an error, success is

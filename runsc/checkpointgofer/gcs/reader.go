@@ -122,14 +122,7 @@ func (r *Reader) workerMain(ctx context.Context) {
 		case sub := <-r.subs:
 			rr, err := obj.NewRangeReader(ctx, sub.off, int64(sub.total))
 			if err != nil {
-				if code, ok := httpCodeFromError(err); ok && code == statusRangeNotSatisfiable {
-					err = io.EOF
-				} else if ok && isPermissionDeniedCode(code) {
-					log.Infof("gcs.Reader returning EACCES for error: %v", err)
-					err = unix.EACCES
-				} else {
-					err = fmt.Errorf("storage.ObjectHandle.NewRangeReader failed: %w", err)
-				}
+				err = readerOpenError(err)
 				r.cmps <- stateio.Completion{
 					ID:  sub.id,
 					Err: err,
@@ -158,4 +151,22 @@ func (r *Reader) workerMain(ctx context.Context) {
 			rr.Close()
 		}
 	}
+}
+
+func readerOpenError(err error) error {
+	if code, ok := httpCodeFromError(err); ok {
+		switch {
+		case code == statusRangeNotSatisfiable:
+			return io.EOF
+		case code == statusNotFound:
+			// Preserve authoritative object absence across stateipc so restore
+			// can distinguish a legacy checkpoint from a temporarily unreadable
+			// commit marker.
+			return unix.ENOENT
+		case isPermissionDeniedCode(code):
+			log.Infof("gcs.Reader returning EACCES for error: %v", err)
+			return unix.EACCES
+		}
+	}
+	return fmt.Errorf("storage.ObjectHandle.NewRangeReader failed: %w", err)
 }

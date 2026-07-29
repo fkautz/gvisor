@@ -18,16 +18,15 @@ package state
 import (
 	"errors"
 	"fmt"
-	"os"
 	"io"
+	"os"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
-	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 )
 
@@ -54,6 +53,11 @@ type SaveOpts struct {
 	// PagesFile is the file in which all MemoryFile pages are stored if
 	// PagesFile is non-nil. Otherwise this content is stored in Destination.
 	PagesFile stateio.AsyncWriter
+
+	// CheckpointCommit is a buffered checkpoint-gofer commit marker. It is
+	// finalized only after runtime and memory state have both saved
+	// successfully; failed saves abort it without publishing its bytes.
+	CheckpointCommit *stateio.BufWriter
 
 	// SharedBaseFile, if non-nil, is the base.img output: k.SaveTo exports the
 	// main MemoryFile's shared base into it and saves a delta-only checkpoint
@@ -90,7 +94,7 @@ type SaveOpts struct {
 
 // Close releases resources owned by opts.
 func (opts *SaveOpts) Close() error {
-	var dstErr, pmErr, pfErr error
+	var dstErr, pmErr, pfErr, commitErr error
 	if c, ok := opts.Destination.(io.Closer); ok {
 		dstErr = c.Close()
 	}
@@ -100,11 +104,30 @@ func (opts *SaveOpts) Close() error {
 	if opts.PagesFile != nil {
 		pfErr = opts.PagesFile.Close()
 	}
-	return errors.Join(dstErr, pmErr, pfErr)
+	if opts.CheckpointCommit != nil {
+		commitErr = opts.CheckpointCommit.Abort()
+	}
+	return errors.Join(dstErr, pmErr, pfErr, commitErr)
 }
 
 // Save saves the system state.
-func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Watchdog) error {
+type saveKernel interface {
+	Pause()
+	ReceiveTaskStates()
+	Unpause()
+	SaveTo(context.Context, io.WriteCloser, io.WriteCloser, stateio.AsyncWriter, *os.File, bool, bool) error
+	SetSaveSuccess(bool)
+	SetSaveError(error)
+	BeforeResume(context.Context)
+	Kill(linux.WaitStatus)
+}
+
+type saveWatchdog interface {
+	Stop()
+	Start()
+}
+
+func (opts *SaveOpts) Save(ctx context.Context, k saveKernel, w saveWatchdog) error {
 	t, err := CPUTime()
 	if err != nil {
 		log.Warningf("Error getting cpu time: %v", err)
@@ -162,8 +185,11 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		err = fmt.Errorf("statefile.NewWriter failed: %w", err)
 	} else {
 		opts.Destination = nil
-		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.SharedBaseFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership
+		// Save the kernel and publish the checkpoint-gofer commit marker only
+		// after every runtime and memory plane finalizes successfully.
+		err = saveKernelToCheckpoint(func() error {
+			return k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.SharedBaseFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership
+		}, &opts.CheckpointCommit)
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.SharedBaseFile = nil
@@ -184,6 +210,15 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		// Kill the sandbox.
 		k.Kill(linux.WaitStatusExit(0))
 	}
+	return err
+}
+
+// saveKernelToCheckpoint runs the Kernel.SaveTo boundary and resolves the
+// buffered commit marker. A successful save publishes it; a failed save aborts
+// it without flushing any marker bytes.
+func saveKernelToCheckpoint(saveTo func() error, commit **stateio.BufWriter) error {
+	err := checkpointfiles.SaveAndCommit(saveTo, *commit)
+	*commit = nil
 	return err
 }
 
