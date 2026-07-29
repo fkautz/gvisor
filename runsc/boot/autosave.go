@@ -16,65 +16,67 @@ package boot
 
 import (
 	"fmt"
-	"io"
+	"os"
 
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/state"
-	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
+	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/urpc"
 )
 
-func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
-	return func(k *kernel.Kernel) {
-		// Discard the state file contents for save-resume. There is no need to
-		// verify the state file, we just need the sandbox to continue running
-		// after save.
-		saveOpts := state.SaveOpts{
-			Autosave:    true,
-			Resume:      true,
-			Destination: io.Discard,
-		}
-		defer saveOpts.Close()
-		l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{})
-	}
-}
-
-func getTargetForSaveRestore(l *Loader, files []*fd.FD) func(k *kernel.Kernel) {
-	if len(files) != 1 && len(files) != 3 {
-		panic(fmt.Sprintf("Unexpected number of files: %v", len(files)))
-	}
-
+func getTargetForSaveRestore(l *Loader, files []*fd.FD, resume bool) func(k *kernel.Kernel) {
 	var once sync.Once
 	return func(k *kernel.Kernel) {
 		once.Do(func() {
-			saveOpts := state.SaveOpts{
-				Autosave:    true,
-				Resume:      false,
-				Destination: files[0],
+			publishDir := l.savePublishDir
+			l.savePublishDir = nil
+			osFiles := make([]*os.File, len(files))
+			for i, file := range files {
+				var err error
+				osFiles[i], err = file.File()
+				if err != nil {
+					for _, opened := range osFiles[:i] {
+						_ = opened.Close()
+					}
+					err = finishConfiguredSave(files, publishDir, err)
+					l.k.OnCheckpointAttempt(err)
+					return
+				}
 			}
-			if len(files) == 3 {
-				saveOpts.PagesMetadata = stateio.NewBufioWriteCloser(files[1])
-				saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(files[2].Release()))
+			opts, err := control.ConvertToStateSaveOpts(&control.SaveOpts{
+				Metadata:      statefile.CompressionLevelFlateBestSpeed.ToMetadata(),
+				HavePagesFile: true,
+				Resume:        resume,
+				FilePayload:   urpc.FilePayload{Files: osFiles},
+			})
+			if err != nil {
+				for _, file := range osFiles {
+					_ = file.Close()
+				}
+				err = finishConfiguredSave(files, publishDir, err)
+				l.k.OnCheckpointAttempt(err)
+				return
 			}
-			defer saveOpts.Close()
-			l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{})
+			opts.Autosave = true
+			defer opts.Close()
+			_ = l.saveWithOptsAndFinalize(opts, &control.SaveRestoreExecOpts{}, func(saveErr error) error {
+				return finishConfiguredSave(files, publishDir, saveErr)
+			})
 		})
 	}
 }
 
 // enableAutosave enables auto save restore in syscall tests.
 func enableAutosave(l *Loader, isResume bool, files []*fd.FD) error {
-	var target func(k *kernel.Kernel)
-	if isResume {
-		target = getTargetForSaveResume(l)
-	} else {
-		target = getTargetForSaveRestore(l, files)
+	if len(files) != 3 {
+		return fmt.Errorf("unexpected autosave plane count %d, want 3", len(files))
 	}
+	target := getTargetForSaveRestore(l, files, isResume)
 
 	for _, table := range kernel.SyscallTables() {
 		sys, ok := strace.Lookup(table.OS, table.Arch)

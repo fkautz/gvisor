@@ -251,8 +251,12 @@ func (s *FileServer) Destroy() {
 func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 	// Files other than the pages file are read using stateio.BufReader, which
 	// doesn't use MaxRanges > 1.
-	switch path {
-	case checkpointfiles.StateFileName:
+	checkpointPath, generationScoped := checkpointfiles.ParseGenerationFileName(path)
+	if !generationScoped {
+		checkpointPath = path
+	}
+	switch checkpointPath {
+	case checkpointfiles.StateFileName, checkpointfiles.CommitFileName:
 		if !s.allowCheckpointReads {
 			log.Warningf("gcs.FileServer.OpenRead: attempted to open %q with allowCheckpointReads disabled", path)
 			return nil, fs.ErrPermission
@@ -280,7 +284,7 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 		return NewReader(s.ctx, obj, miscFileMaxReadBytes, 1 /* maxRanges */, miscFileMaxReadParallel), nil
 
 	case checkpointfiles.PagesMetadataFileName:
-		if !s.allowCheckpointReads && !s.allowFSCheckpointReads {
+		if (generationScoped && !s.allowCheckpointReads) || (!generationScoped && !s.allowCheckpointReads && !s.allowFSCheckpointReads) {
 			log.Warningf("gcs.FileServer.OpenRead: attempted to open %q with allowCheckpointReads and allowFSCheckpointReads disabled", path)
 			return nil, fs.ErrPermission
 		}
@@ -289,7 +293,7 @@ func (s *FileServer) OpenRead(path string) (stateio.AsyncReader, error) {
 		return NewReader(s.ctx, obj, miscFileMaxReadBytes, 1 /* maxRanges */, miscFileMaxReadParallel), nil
 
 	case checkpointfiles.PagesFileName:
-		if !s.allowCheckpointReads && !s.allowFSCheckpointReads {
+		if (generationScoped && !s.allowCheckpointReads) || (!generationScoped && !s.allowCheckpointReads && !s.allowFSCheckpointReads) {
 			log.Warningf("gcs.FileServer.OpenRead: attempted to open %q with allowCheckpointReads and allowFSCheckpointReads disabled", path)
 			return nil, fs.ErrPermission
 		}
@@ -312,8 +316,12 @@ func (s *FileServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 	// Files other than the pages file are written using stateio.BufWriter,
 	// which doesn't use MaxRanges > 1, and are expected to be too small to
 	// benefit from parallel composite upload.
-	switch path {
-	case checkpointfiles.StateFileName:
+	checkpointPath, generationScoped := checkpointfiles.ParseGenerationFileName(path)
+	if !generationScoped {
+		checkpointPath = path
+	}
+	switch checkpointPath {
+	case checkpointfiles.StateFileName, checkpointfiles.CommitFileName:
 		if !s.allowCheckpointWrites {
 			log.Warningf("gcs.FileServer.OpenWrite: attempted to open %q with allowCheckpointWrites disabled", path)
 			return nil, fs.ErrPermission
@@ -341,7 +349,7 @@ func (s *FileServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 		return NewWriter(s.ctx, obj, miscFileMaxWriteBytes, 1 /* maxRanges */, miscFileMaxWriteParallel), nil
 
 	case checkpointfiles.PagesMetadataFileName:
-		if !s.allowCheckpointWrites && !s.allowFSCheckpointWrites {
+		if (generationScoped && !s.allowCheckpointWrites) || (!generationScoped && !s.allowCheckpointWrites && !s.allowFSCheckpointWrites) {
 			log.Warningf("gcs.FileServer.OpenWrite: attempted to open %q with allowCheckpointWrites and allowFSCheckpointWrites disabled", path)
 			return nil, fs.ErrPermission
 		}
@@ -350,7 +358,7 @@ func (s *FileServer) OpenWrite(path string) (stateio.AsyncWriter, error) {
 		return NewWriter(s.ctx, obj, miscFileMaxWriteBytes, 1 /* maxRanges */, miscFileMaxWriteParallel), nil
 
 	case checkpointfiles.PagesFileName:
-		if !s.allowCheckpointWrites && !s.allowFSCheckpointWrites {
+		if (generationScoped && !s.allowCheckpointWrites) || (!generationScoped && !s.allowCheckpointWrites && !s.allowFSCheckpointWrites) {
 			log.Warningf("gcs.FileServer.OpenWrite: attempted to open %q with allowCheckpointWrites and allowFSCheckpointWrites disabled", path)
 			return nil, fs.ErrPermission
 		}
