@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 const (
@@ -31,6 +32,7 @@ const (
 	uffdioRegisterMissing   = 1
 	uffdioRegisterMinor     = 4
 	uffdPagefaultFlagMinor  = 1 << 2
+	uffdioCopyModeDontWake  = 1
 )
 
 type uffdioAPIRequest struct {
@@ -68,6 +70,7 @@ type casimirFaultWakeup interface {
 	wakeFault(pageStart, pageSize uint64) error
 	zeroFault(pageStart, pageSize uint64) error
 	copyFault(pageStart, pageSize uint64, data []byte) error
+	installFault(pageStart, pageSize uint64, data []byte) error
 }
 
 type casimirFaultSyscalls interface {
@@ -145,11 +148,29 @@ func (u userfaultfdWakeup) copyFault(pageStart, pageSize uint64, data []byte) er
 	return nil
 }
 
+func (u userfaultfdWakeup) installFault(pageStart, pageSize uint64, data []byte) error {
+	request := uffdioCopyRequest{
+		Dst:  pageStart,
+		Src:  uint64(uintptr(unsafe.Pointer(&data[0]))),
+		Len:  pageSize,
+		Mode: uffdioCopyModeDontWake,
+	}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(u), uffdioCopy, uintptr(unsafe.Pointer(&request))); errno != 0 {
+		return errno
+	}
+	runtime.KeepAlive(data)
+	return nil
+}
+
 type casimirFaultRequest struct {
-	Operation string `json:"operation"`
-	FaultMode string `json:"fault_mode,omitempty"`
-	Offset    uint64 `json:"offset"`
-	Length    uint64 `json:"length"`
+	Operation      string             `json:"operation"`
+	FaultMode      string             `json:"fault_mode,omitempty"`
+	Offset         uint64             `json:"offset"`
+	Length         uint64             `json:"length"`
+	AddressSpace   CasimirAuthorityID `json:"address_space,omitempty"`
+	GuestPageIndex uint64             `json:"guest_page_index,omitempty"`
+	ReceiptKind    string             `json:"receipt_kind,omitempty"`
+	ExposureID     uint64             `json:"exposure_id,omitempty"`
 }
 
 type casimirFaultResponse struct {
@@ -161,6 +182,82 @@ type casimirFaultResponse struct {
 	Data        []byte          `json:"data,omitempty"`
 	Regions     []CasimirRegion `json:"regions,omitempty"`
 	Layout      CasimirLayout   `json:"layout,omitempty"`
+	ExposureID  uint64          `json:"exposure_id,omitempty"`
+}
+
+type casimirFaultQualifier struct {
+	offset         uint64
+	addressSpace   CasimirAuthorityID
+	guestPageIndex uint64
+	started        chan struct{}
+	done           chan error
+}
+
+type casimirFaultQualifierTracker struct {
+	mu         sync.RWMutex
+	qualifier  casimirFaultQualifier
+	valid      bool
+	authorized map[uint64]casimirFaultAuthorization
+}
+
+type casimirFaultAuthorization struct {
+	addressSpace   CasimirAuthorityID
+	guestPageIndex uint64
+}
+
+func (t *casimirFaultQualifierTracker) publish(qualifier casimirFaultQualifier) {
+	t.mu.Lock()
+	t.qualifier = qualifier
+	t.valid = true
+	t.mu.Unlock()
+}
+
+func (t *casimirFaultQualifierTracker) clear() {
+	t.mu.Lock()
+	t.qualifier = casimirFaultQualifier{}
+	t.valid = false
+	t.mu.Unlock()
+}
+
+func (t *casimirFaultQualifierTracker) begin(offset uint64) (casimirFaultQualifier, bool) {
+	if t == nil {
+		return casimirFaultQualifier{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.valid || t.qualifier.offset != offset {
+		return casimirFaultQualifier{}, false
+	}
+	select {
+	case <-t.qualifier.started:
+	default:
+		close(t.qualifier.started)
+	}
+	return t.qualifier, true
+}
+
+func (t *casimirFaultQualifierTracker) complete(qualifier casimirFaultQualifier, err error) {
+	if err == nil {
+		t.mu.Lock()
+		if t.authorized == nil {
+			t.authorized = make(map[uint64]casimirFaultAuthorization)
+		}
+		t.authorized[qualifier.offset] = casimirFaultAuthorization{
+			addressSpace:   qualifier.addressSpace,
+			guestPageIndex: qualifier.guestPageIndex,
+		}
+		t.mu.Unlock()
+	}
+	qualifier.done <- err
+}
+
+func (t *casimirFaultQualifierTracker) isAuthorized(qualifier casimirFaultQualifier) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	authorization, ok := t.authorized[qualifier.offset]
+	return ok &&
+		authorization.addressSpace == qualifier.addressSpace &&
+		authorization.guestPageIndex == qualifier.guestPageIndex
 }
 
 func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pageSize uint64) (string, error) {
@@ -215,7 +312,17 @@ func resolveCasimirFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode s
 	if err != nil {
 		return "", err
 	}
+	if response.ExposureID != 0 {
+		return "", fmt.Errorf("reject exposure ID on unqualified Casimir fault: %w", unix.EINVAL)
+	}
 	pageStart := address &^ (pageSize - 1)
+	if err := applyCasimirFaultAction(wakeup, action, pageStart, pageSize, response.Data); err != nil {
+		return "", err
+	}
+	return action, nil
+}
+
+func applyCasimirFaultAction(wakeup casimirFaultWakeup, action string, pageStart, pageSize uint64, data []byte) error {
 	switch action {
 	case "wake":
 		// Casimir has already materialized the verified page into the shared
@@ -223,24 +330,117 @@ func resolveCasimirFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, mode s
 		// retries against that page; the exact retry is then authorized as a
 		// resident MINOR continuation by casimirFaultTransitions.
 		if err := wakeup.wakeFault(pageStart, pageSize); err != nil {
-			return "", fmt.Errorf("wake Casimir published page: %w", err)
+			return fmt.Errorf("wake Casimir published page: %w", err)
 		}
 	case "continue":
 		if err := wakeup.continueFault(pageStart, pageSize); err != nil {
-			return "", fmt.Errorf("continue Casimir resident page: %w", err)
+			return fmt.Errorf("continue Casimir resident page: %w", err)
 		}
 	case "zero":
 		if err := wakeup.zeroFault(pageStart, pageSize); err != nil {
-			return "", fmt.Errorf("install Casimir verified zero: %w", err)
+			return fmt.Errorf("install Casimir verified zero: %w", err)
 		}
 	case "copy":
-		if err := wakeup.copyFault(pageStart, pageSize, response.Data); err != nil {
-			return "", fmt.Errorf("install Casimir verified page: %w", err)
+		if err := wakeup.copyFault(pageStart, pageSize, data); err != nil {
+			return fmt.Errorf("install Casimir verified page: %w", err)
 		}
 	default:
-		return "", fmt.Errorf("unhandled Casimir fault action %q: %w", action, unix.EINVAL)
+		return fmt.Errorf("unhandled Casimir fault action %q: %w", action, unix.EINVAL)
 	}
-	return action, nil
+	return nil
+}
+
+func resolveCasimirStateRootFault(rw *bufio.ReadWriter, wakeup casimirFaultWakeup, qualifier casimirFaultQualifier, mode string, offset, address, pageSize uint64) error {
+	if qualifier.addressSpace == (CasimirAuthorityID{}) ||
+		qualifier.offset != offset ||
+		(mode != "missing" && mode != "minor") ||
+		pageSize == 0 ||
+		pageSize&(pageSize-1) != 0 {
+		return fmt.Errorf("reject qualified Casimir fault request: %w", unix.EINVAL)
+	}
+	request := casimirFaultRequest{
+		Operation:      "fault",
+		FaultMode:      mode,
+		Offset:         offset,
+		Length:         pageSize,
+		AddressSpace:   qualifier.addressSpace,
+		GuestPageIndex: qualifier.guestPageIndex,
+	}
+	if err := json.NewEncoder(rw).Encode(request); err != nil {
+		return fmt.Errorf("encode qualified Casimir fault request: %w", err)
+	}
+	if err := rw.Flush(); err != nil {
+		return fmt.Errorf("flush qualified Casimir fault request: %w", err)
+	}
+	var response casimirFaultResponse
+	if err := json.NewDecoder(rw).Decode(&response); err != nil {
+		return fmt.Errorf("decode qualified Casimir fault response: %w", err)
+	}
+	action, err := validateCasimirFaultResponse(response, mode, pageSize)
+	if err != nil {
+		return err
+	}
+	pageStart := address &^ (pageSize - 1)
+	if response.ExposureID == 0 {
+		return applyCasimirFaultAction(wakeup, action, pageStart, pageSize, response.Data)
+	}
+	if action != "copy" || mode != "missing" {
+		return fmt.Errorf("reject exposed Casimir State Root fault action=%q mode=%q: %w", action, mode, unix.EINVAL)
+	}
+	if err := wakeup.installFault(pageStart, pageSize, response.Data); err != nil {
+		return fmt.Errorf("install Casimir State Root page without wake: %w", err)
+	}
+	if err := acknowledgeCasimirStateRootFault(rw, request, response.ExposureID, "page-installed"); err != nil {
+		return err
+	}
+	if err := wakeup.wakeFault(pageStart, pageSize); err != nil {
+		return fmt.Errorf("wake exact Casimir State Root fault: %w", err)
+	}
+	if err := acknowledgeCasimirStateRootFault(rw, request, response.ExposureID, "fault-resumed"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func acknowledgeCasimirStateRootFault(rw *bufio.ReadWriter, fault casimirFaultRequest, exposureID uint64, receiptKind string) error {
+	receipt := casimirFaultRequest{
+		Operation:      "state-root-receipt",
+		Offset:         fault.Offset,
+		Length:         fault.Length,
+		AddressSpace:   fault.AddressSpace,
+		GuestPageIndex: fault.GuestPageIndex,
+		ReceiptKind:    receiptKind,
+		ExposureID:     exposureID,
+	}
+	if err := json.NewEncoder(rw).Encode(receipt); err != nil {
+		return fmt.Errorf("encode Casimir %s receipt: %w", receiptKind, err)
+	}
+	if err := rw.Flush(); err != nil {
+		return fmt.Errorf("flush Casimir %s receipt: %w", receiptKind, err)
+	}
+	var acknowledgement casimirFaultResponse
+	if err := json.NewDecoder(rw).Decode(&acknowledgement); err != nil {
+		return fmt.Errorf("decode Casimir %s acknowledgement: %w", receiptKind, err)
+	}
+	if acknowledgement.Error != "" ||
+		!acknowledgement.Continue ||
+		acknowledgement.Fatal ||
+		acknowledgement.Zero ||
+		acknowledgement.FaultAction != "" ||
+		len(acknowledgement.Data) != 0 ||
+		acknowledgement.ExposureID != 0 ||
+		len(acknowledgement.Regions) != 0 ||
+		len(acknowledgement.Layout.AddressSpaces) != 0 {
+		return fmt.Errorf(
+			"reject Casimir %s acknowledgement: continue=%t exposure_id=%d error=%q: %w",
+			receiptKind,
+			acknowledgement.Continue,
+			acknowledgement.ExposureID,
+			acknowledgement.Error,
+			unix.EINVAL,
+		)
+	}
+	return nil
 }
 
 // casimirFaultTransitions bounds the MISSING publish/retry protocol. One
@@ -346,11 +546,15 @@ func verifyCasimirFaultBaseIdentity(readOnlyBase, faultBase *os.File) error {
 	return nil
 }
 
-func startCasimirFaults(dataFile *os.File, start uintptr, length uint64) (CasimirLayout, error) {
-	return startCasimirFaultsWithSyscalls(dataFile, start, length, linuxCasimirFaultSyscalls{})
+func startCasimirFaults(dataFile *os.File, start uintptr, length uint64, qualifiers *casimirFaultQualifierTracker) (CasimirLayout, error) {
+	return startCasimirFaultsWithTracker(dataFile, start, length, linuxCasimirFaultSyscalls{}, qualifiers)
 }
 
 func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls) (CasimirLayout, error) {
+	return startCasimirFaultsWithTracker(dataFile, start, length, syscalls, &casimirFaultQualifierTracker{})
+}
+
+func startCasimirFaultsWithTracker(dataFile *os.File, start uintptr, length uint64, syscalls casimirFaultSyscalls, qualifiers *casimirFaultQualifierTracker) (CasimirLayout, error) {
 	const flags = uintptr(unix.O_CLOEXEC | unix.O_NONBLOCK | uffdUserModeOnly)
 	fd, err := syscalls.userfaultfd(flags)
 	if err != nil {
@@ -385,7 +589,7 @@ func startCasimirFaultsWithSyscalls(dataFile *os.File, start uintptr, length uin
 		conn.Close()
 		return CasimirLayout{}, closeCasimirFaultFD(syscalls, fd, fmt.Errorf("consume Casimir mappings: %w", err))
 	}
-	go serveCasimirFaults(int(fd), conn, rw, uint64(start), length)
+	go serveCasimirFaults(int(fd), conn, rw, uint64(start), length, qualifiers)
 	return regions, nil
 }
 
@@ -411,13 +615,20 @@ func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) (CasimirLayout,
 	if err := json.NewDecoder(rw).Decode(&response); err != nil {
 		return CasimirLayout{}, err
 	}
-	if response.Error != "" || response.Layout.Version != 2 || response.Layout.PageSize == 0 || len(response.Layout.AddressSpaces) == 0 || len(response.Regions) != 0 {
+	if response.Error != "" ||
+		response.Layout.Version != 2 ||
+		uint64(response.Layout.PageSize) != uint64(os.Getpagesize()) ||
+		len(response.Layout.AddressSpaces) == 0 ||
+		len(response.Regions) != 0 {
 		log.Warningf("Casimir LLML2 layout rejected: error=%q version=%d address_spaces=%d legacy_regions=%d", response.Error, response.Layout.Version, len(response.Layout.AddressSpaces), len(response.Regions))
 		return CasimirLayout{}, unix.EINVAL
 	}
 	var previous CasimirAuthorityID
 	for i, addressSpace := range response.Layout.AddressSpaces {
-		if addressSpace.MinAddr >= addressSpace.MaxAddr || len(addressSpace.Regions) == 0 || (i != 0 && string(previous[:]) >= string(addressSpace.Identity[:])) {
+		if addressSpace.Identity == (CasimirAuthorityID{}) ||
+			addressSpace.MinAddr >= addressSpace.MaxAddr ||
+			len(addressSpace.Regions) == 0 ||
+			(i != 0 && string(previous[:]) >= string(addressSpace.Identity[:])) {
 			return CasimirLayout{}, unix.EINVAL
 		}
 		next := addressSpace.MinAddr
@@ -445,7 +656,7 @@ func consumeCasimirMappings(rw *bufio.ReadWriter, length uint64) (CasimirLayout,
 	return response.Layout.Clone(), nil
 }
 
-func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, length uint64) {
+func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, length uint64, qualifiers *casimirFaultQualifierTracker) {
 	defer unix.Close(uffd)
 	defer conn.Close()
 	// Any loss or rejection of the verifier channel leaves a missing page
@@ -485,6 +696,15 @@ func serveCasimirFaults(uffd int, conn net.Conn, rw *bufio.ReadWriter, start, le
 		mode := "missing"
 		if flags&uffdPagefaultFlagMinor != 0 {
 			mode = "minor"
+		}
+		if qualifier, ok := qualifiers.begin(offset); ok {
+			err := resolveCasimirStateRootFault(rw, userfaultfdWakeup(uffd), qualifier, mode, offset, address, pageSize)
+			qualifiers.complete(qualifier, err)
+			if err != nil {
+				log.Warningf("Casimir State Root fault resolution failed: %v", err)
+				return
+			}
+			continue
 		}
 		if err := transitions.resolve(rw, userfaultfdWakeup(uffd), mode, offset, address, pageSize); err != nil {
 			log.Warningf("Casimir fault resolution failed: %v", err)

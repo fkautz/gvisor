@@ -44,6 +44,9 @@ func TestCaptureCasimirAddressSpaceIncludesLazyRangesAndGaps(t *testing.T) {
 	if err := manager.RestoreCasimirMappings(ctx, layout); err != nil {
 		t.Fatalf("exact restored layout rejected: %v", err)
 	}
+	if manager.casimirIdentity != identity {
+		t.Fatalf("restored Casimir identity = %x, want %x", manager.casimirIdentity, identity)
+	}
 	layout.Regions[0].Length += hostarch.PageSize
 	if err := manager.RestoreCasimirMappings(ctx, layout); err == nil {
 		t.Fatal("mutated signed layout accepted")

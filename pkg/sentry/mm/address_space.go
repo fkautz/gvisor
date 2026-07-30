@@ -95,6 +95,17 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			perms.Write = false
 		}
 		if perms.Any() { // MapFile precondition
+			if mf, ok := pma.file.(*pgalloc.MemoryFile); ok &&
+				mf.UsesCasimirFaults() &&
+				mm.casimirIdentity != (pgalloc.CasimirAuthorityID{}) {
+				if err := mf.PrefetchCasimirRangeForGuest(
+					pseg.fileRangeOf(pmaMapAR),
+					mm.casimirIdentity,
+					uint64(pmaMapAR.Start),
+				); err != nil {
+					return err
+				}
+			}
 			// If the length of the mapping exceeds singleMapThreshold, call
 			// AddressSpace.MapFile() on singleMapThreshold-aligned chunks so
 			// we can check ctx.Killed() reasonably frequently.

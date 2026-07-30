@@ -225,6 +225,49 @@ func equalInts(left, right []int) bool {
 	return true
 }
 
+func TestCasimirFaultQualifierTracksOnlyExactCurrentPage(t *testing.T) {
+	tracker := &casimirFaultQualifierTracker{}
+	qualifier := casimirFaultQualifier{
+		offset:         4096,
+		addressSpace:   CasimirAuthorityID{1},
+		guestPageIndex: 7,
+		started:        make(chan struct{}),
+		done:           make(chan error, 1),
+	}
+	tracker.publish(qualifier)
+	if _, ok := tracker.begin(0); ok {
+		t.Fatal("qualifier escaped to a different canonical offset")
+	}
+	got, ok := tracker.begin(4096)
+	if !ok ||
+		got.offset != qualifier.offset ||
+		got.addressSpace != qualifier.addressSpace ||
+		got.guestPageIndex != qualifier.guestPageIndex {
+		t.Fatalf("load(exact offset) = (%+v, %t), want exact qualifier", got, ok)
+	}
+	select {
+	case <-qualifier.started:
+	default:
+		t.Fatal("begin(exact offset) did not publish service start")
+	}
+	tracker.complete(qualifier, nil)
+	if err := <-qualifier.done; err != nil {
+		t.Fatalf("complete(exact qualifier) = %v", err)
+	}
+	if !tracker.isAuthorized(qualifier) {
+		t.Fatal("completed exact qualifier was not retained as authorized")
+	}
+	substituted := qualifier
+	substituted.guestPageIndex++
+	if tracker.isAuthorized(substituted) {
+		t.Fatal("different guest page reused an existing canonical-offset authorization")
+	}
+	tracker.clear()
+	if _, ok := tracker.begin(4096); ok {
+		t.Fatal("cleared qualifier remained available to a later fault")
+	}
+}
+
 func TestCasimirFaultAliasIsSharedAndSeparateFromPrivateOverlay(t *testing.T) {
 	pageSize := os.Getpagesize()
 	base, err := os.CreateTemp("", "casimir-fault-alias-*")
@@ -473,6 +516,142 @@ func (w *recordingCasimirWakeup) copyFault(pageStart, pageSize uint64, data []by
 	w.pageStart, w.pageSize = pageStart, pageSize
 	w.data = append([]byte(nil), data...)
 	return nil
+}
+
+func (w *recordingCasimirWakeup) installFault(pageStart, pageSize uint64, data []byte) error {
+	w.calls = append(w.calls, "install")
+	w.pageStart, w.pageSize = pageStart, pageSize
+	w.data = append([]byte(nil), data...)
+	return nil
+}
+
+func TestResolveCasimirStateRootFaultInstallsReceiptsThenResumesExactFault(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan error, 1)
+	page := bytes.Repeat([]byte{0x6b}, 4096)
+	identity := CasimirAuthorityID{1}
+	go func() {
+		defer server.Close()
+		decoder := json.NewDecoder(server)
+		encoder := json.NewEncoder(server)
+		var fault casimirFaultRequest
+		if err := decoder.Decode(&fault); err != nil {
+			serverDone <- err
+			return
+		}
+		if fault.Operation != "fault" ||
+			fault.FaultMode != "missing" ||
+			fault.Offset != 8192 ||
+			fault.Length != 4096 ||
+			fault.AddressSpace != identity ||
+			fault.GuestPageIndex != 9 {
+			serverDone <- fmt.Errorf("unexpected qualified fault request: %+v", fault)
+			return
+		}
+		if err := encoder.Encode(casimirFaultResponse{
+			Data:        page,
+			FaultAction: "copy",
+			ExposureID:  73,
+		}); err != nil {
+			serverDone <- err
+			return
+		}
+		for _, kind := range []string{"page-installed", "fault-resumed"} {
+			var receipt casimirFaultRequest
+			if err := decoder.Decode(&receipt); err != nil {
+				serverDone <- err
+				return
+			}
+			if receipt.Operation != "state-root-receipt" ||
+				receipt.ReceiptKind != kind ||
+				receipt.ExposureID != 73 ||
+				receipt.Offset != 8192 ||
+				receipt.Length != 4096 ||
+				receipt.AddressSpace != identity ||
+				receipt.GuestPageIndex != 9 {
+				serverDone <- fmt.Errorf("unexpected %s receipt: %+v", kind, receipt)
+				return
+			}
+			if err := encoder.Encode(casimirFaultResponse{Continue: true}); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		serverDone <- nil
+	}()
+
+	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	wakeup := &recordingCasimirWakeup{}
+	err := resolveCasimirStateRootFault(
+		rw,
+		wakeup,
+		casimirFaultQualifier{offset: 8192, addressSpace: identity, guestPageIndex: 9},
+		"missing",
+		8192,
+		0x12345,
+		4096,
+	)
+	if err != nil {
+		t.Fatalf("resolveCasimirStateRootFault() error = %v", err)
+	}
+	if got := strings.Join(wakeup.calls, ","); got != "install,wake" {
+		t.Fatalf("native fault boundary calls = %q, want install,wake", got)
+	}
+	if wakeup.pageStart != 0x12000 || wakeup.pageSize != 4096 || !bytes.Equal(wakeup.data, page) {
+		t.Fatal("native fault boundary did not install and wake the exact verified page")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveCasimirStateRootFaultWithholdsWakeWhenInstallReceiptRejected(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer server.Close()
+		decoder := json.NewDecoder(server)
+		encoder := json.NewEncoder(server)
+		var fault casimirFaultRequest
+		if err := decoder.Decode(&fault); err != nil {
+			return
+		}
+		if err := encoder.Encode(casimirFaultResponse{
+			Data:        bytes.Repeat([]byte{0x6b}, 4096),
+			FaultAction: "copy",
+			ExposureID:  74,
+		}); err != nil {
+			return
+		}
+		var receipt casimirFaultRequest
+		if err := decoder.Decode(&receipt); err != nil {
+			return
+		}
+		_ = encoder.Encode(casimirFaultResponse{Error: "receipt rejected"})
+	}()
+
+	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	wakeup := &recordingCasimirWakeup{}
+	err := resolveCasimirStateRootFault(
+		rw,
+		wakeup,
+		casimirFaultQualifier{
+			offset:         8192,
+			addressSpace:   CasimirAuthorityID{1},
+			guestPageIndex: 9,
+		},
+		"missing",
+		8192,
+		0x12345,
+		4096,
+	)
+	if err == nil {
+		t.Fatal("resolveCasimirStateRootFault() error = nil, want receipt rejection")
+	}
+	if got := strings.Join(wakeup.calls, ","); got != "install" {
+		t.Fatalf("native fault boundary calls = %q, want install without wake", got)
+	}
 }
 
 func TestResolveCasimirFaultUsesExplicitActionAsSoleWakeupAuthority(t *testing.T) {

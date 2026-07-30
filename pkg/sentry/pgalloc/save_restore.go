@@ -1087,7 +1087,8 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				if err != nil {
 					return fmt.Errorf("map Casimir shared-base fault alias: %w", err)
 				}
-				regions, err := startCasimirFaults(opts.CasimirDataFile, faultMapping, hi)
+				qualifiers := &casimirFaultQualifierTracker{}
+				regions, err := startCasimirFaults(opts.CasimirDataFile, faultMapping, hi, qualifiers)
 				if err != nil {
 					unix.Syscall(unix.SYS_MUNMAP, faultMapping, uintptr(hi), 0)
 					return fmt.Errorf("start Casimir shared-base faults: %w", err)
@@ -1095,6 +1096,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				f.casimirFaultMapping = faultMapping
 				f.casimirFaultMappingLen = hi
 				f.casimirMappings = regions
+				f.casimirFaultQualifier = qualifiers
 				f.casimirFaults.Store(1)
 			} else if opts.CasimirFaultBaseFile != nil {
 				opts.CasimirFaultBaseFile.Close()

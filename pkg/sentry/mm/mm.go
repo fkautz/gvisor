@@ -162,6 +162,11 @@ type MemoryManager struct {
 	// until users becomes 0, at which point as becomes nil.
 	as platform.AddressSpace `state:"nosave"`
 
+	// casimirIdentity is the authenticated LLML2 identity for this address
+	// space. It is installed only after the restored VMA graph is proven
+	// byte-for-byte equal to signed authority.
+	casimirIdentity pgalloc.CasimirAuthorityID `state:"nosave"`
+
 	// If captureInvalidations is true, calls to MM.Invalidate() are recorded
 	// in capturedInvalidations rather than being applied immediately to pmas.
 	// This is to avoid a race condition in MM.Fork(); see that function for

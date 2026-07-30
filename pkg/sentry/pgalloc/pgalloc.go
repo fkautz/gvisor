@@ -212,6 +212,12 @@ type MemoryFile struct {
 	casimirFaultMapping    uintptr       `state:"nosave"`
 	casimirFaultMappingLen uint64        `state:"nosave"`
 	casimirMappings        CasimirLayout `state:"nosave"`
+	// casimirFaultRequestMu serializes guest-qualified touches of the shared
+	// fault alias. casimirFaultQualifier publishes the exact address-space
+	// identity and guest page that caused the current alias fault to the
+	// userfaultfd service.
+	casimirFaultRequestMu sync.Mutex                    `state:"nosave"`
+	casimirFaultQualifier *casimirFaultQualifierTracker `state:"nosave"`
 
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
@@ -1672,6 +1678,64 @@ func (f *MemoryFile) prefetchCasimirRange(fr memmap.FileRange) error {
 		address := f.casimirFaultMapping + uintptr(offset)
 		bytes := unsafe.Slice((*byte)(unsafe.Pointer(address)), hostarch.PageSize)
 		if _, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PrefetchCasimirRangeForGuest resolves each shared-base page at the real
+// MemoryManager mapping boundary while retaining the exact signed guest
+// address-space/page identity. The caller remains blocked until the verifier
+// installs and explicitly authorizes resumption of this exact range.
+func (f *MemoryFile) PrefetchCasimirRangeForGuest(fr memmap.FileRange, addressSpace CasimirAuthorityID, guestStart uint64) error {
+	if f.casimirFaults.Load() == 0 {
+		return nil
+	}
+	if addressSpace == (CasimirAuthorityID{}) ||
+		guestStart%hostarch.PageSize != 0 ||
+		!fr.WellFormed() ||
+		fr.Start%hostarch.PageSize != 0 ||
+		fr.End%hostarch.PageSize != 0 {
+		return linuxerr.EINVAL
+	}
+	if f.casimirFaultMapping == 0 || f.casimirFaultQualifier == nil {
+		return linuxerr.EFAULT
+	}
+	if fr.Start >= f.casimirFaultMappingLen {
+		return nil
+	}
+	end := min(fr.End, f.casimirFaultMappingLen)
+	f.casimirFaultRequestMu.Lock()
+	defer f.casimirFaultRequestMu.Unlock()
+	for offset := fr.Start; offset < end; offset += hostarch.PageSize {
+		guestAddress := guestStart + offset - fr.Start
+		if guestAddress < guestStart {
+			return linuxerr.EOVERFLOW
+		}
+		qualifier := casimirFaultQualifier{
+			offset:         offset,
+			addressSpace:   addressSpace,
+			guestPageIndex: guestAddress / hostarch.PageSize,
+			started:        make(chan struct{}),
+			done:           make(chan error, 1),
+		}
+		f.casimirFaultQualifier.publish(qualifier)
+		address := f.casimirFaultMapping + uintptr(offset)
+		bytes := unsafe.Slice((*byte)(unsafe.Pointer(address)), hostarch.PageSize)
+		_, err := safemem.LoadUint32(safemem.BlockFromSafeSlice(bytes))
+		if err == nil {
+			select {
+			case <-qualifier.started:
+				err = <-qualifier.done
+			default:
+				if !f.casimirFaultQualifier.isAuthorized(qualifier) {
+					err = linuxerr.EFAULT
+				}
+			}
+		}
+		f.casimirFaultQualifier.clear()
+		if err != nil {
 			return err
 		}
 	}

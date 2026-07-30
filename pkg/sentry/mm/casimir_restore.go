@@ -126,6 +126,7 @@ func (mm *MemoryManager) RestoreCasimirMappings(ctx context.Context, signed pgal
 	if !reflect.DeepEqual(got, signed) {
 		return fmt.Errorf("restored VMA geometry differs from signed LLML2 authority")
 	}
+	mm.casimirIdentity = signed.Identity
 	return nil
 }
 
