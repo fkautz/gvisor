@@ -91,8 +91,19 @@ type casimirReadRequest struct {
 }
 
 type casimirReadResponse struct {
-	Data  []byte `json:"data,omitempty"`
-	Error string `json:"error,omitempty"`
+	Data       []byte `json:"data,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Continue   bool   `json:"continue,omitempty"`
+	ExposureID uint64 `json:"exposure_id,omitempty"`
+}
+
+type casimirExposureReceipt struct {
+	Operation   string `json:"operation"`
+	ReceiptKind string `json:"receipt_kind"`
+	ExposureID  uint64 `json:"exposure_id"`
+	Path        string `json:"path,omitempty"`
+	Offset      uint64 `json:"offset"`
+	Length      uint64 `json:"length"`
 }
 
 type casimirDataClient struct {
@@ -128,6 +139,35 @@ func (c *casimirDataClient) read(path string, dst []byte, off uint64) (uint64, e
 		return 0, fmt.Errorf("casimir fs-plane oversized response: %d > %d", len(response.Data), len(dst))
 	}
 	copy(dst, response.Data)
+	if response.ExposureID != 0 {
+		receipt := casimirExposureReceipt{
+			Operation:   "state-root-receipt",
+			ReceiptKind: "vfs-read-return",
+			ExposureID:  response.ExposureID,
+			Path:        path,
+			Offset:      off,
+			Length:      uint64(len(response.Data)),
+		}
+		if err := json.NewEncoder(c.rw).Encode(receipt); err != nil {
+			return 0, fmt.Errorf("encode Casimir VFS read-return receipt: %w", err)
+		}
+		if err := c.rw.Flush(); err != nil {
+			return 0, fmt.Errorf("flush Casimir VFS read-return receipt: %w", err)
+		}
+		var acknowledgement casimirReadResponse
+		if err := json.NewDecoder(c.rw).Decode(&acknowledgement); err != nil {
+			return 0, fmt.Errorf("decode Casimir VFS read-return acknowledgement: %w", err)
+		}
+		if acknowledgement.Error != "" || !acknowledgement.Continue ||
+			len(acknowledgement.Data) != 0 || acknowledgement.ExposureID != 0 {
+			return 0, fmt.Errorf(
+				"reject Casimir VFS read-return acknowledgement: continue=%t exposure_id=%d error=%q",
+				acknowledgement.Continue,
+				acknowledgement.ExposureID,
+				acknowledgement.Error,
+			)
+		}
+	}
 	return uint64(len(response.Data)), nil
 }
 

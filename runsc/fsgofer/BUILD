@@ -33,6 +33,13 @@ go_test(
 )
 
 go_test(
+    name = "casimir_native_exposure_test",
+    size = "small",
+    srcs = ["casimir_native_exposure_test.go"],
+    embed = [":fsgofer"],
+)
+
+go_test(
 	name = "lisafs_test",
     size = "small",
     srcs = ["lisafs_test.go"],
