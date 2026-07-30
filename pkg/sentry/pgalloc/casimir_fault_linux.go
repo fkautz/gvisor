@@ -174,15 +174,21 @@ type casimirFaultRequest struct {
 }
 
 type casimirFaultResponse struct {
-	Error       string          `json:"error,omitempty"`
-	Zero        bool            `json:"zero,omitempty"`
-	Continue    bool            `json:"continue,omitempty"`
-	Fatal       bool            `json:"fatal,omitempty"`
-	FaultAction string          `json:"fault_action"`
-	Data        []byte          `json:"data,omitempty"`
-	Regions     []CasimirRegion `json:"regions,omitempty"`
-	Layout      CasimirLayout   `json:"layout,omitempty"`
-	ExposureID  uint64          `json:"exposure_id,omitempty"`
+	Operation      string             `json:"operation,omitempty"`
+	ReceiptKind    string             `json:"receipt_kind,omitempty"`
+	Error          string             `json:"error,omitempty"`
+	Zero           bool               `json:"zero,omitempty"`
+	Continue       bool               `json:"continue,omitempty"`
+	Fatal          bool               `json:"fatal,omitempty"`
+	FaultAction    string             `json:"fault_action"`
+	Data           []byte             `json:"data,omitempty"`
+	Regions        []CasimirRegion    `json:"regions,omitempty"`
+	Layout         CasimirLayout      `json:"layout,omitempty"`
+	ExposureID     uint64             `json:"exposure_id,omitempty"`
+	Offset         uint64             `json:"offset,omitempty"`
+	Length         uint64             `json:"length,omitempty"`
+	AddressSpace   CasimirAuthorityID `json:"address_space,omitempty"`
+	GuestPageIndex uint64             `json:"guest_page_index,omitempty"`
 }
 
 type casimirFaultQualifier struct {
@@ -263,6 +269,14 @@ func (t *casimirFaultQualifierTracker) isAuthorized(qualifier casimirFaultQualif
 func validateCasimirFaultResponse(response casimirFaultResponse, mode string, pageSize uint64) (string, error) {
 	reject := func(reason string) (string, error) {
 		return "", fmt.Errorf("reject Casimir fault response: %s: %w", reason, unix.EINVAL)
+	}
+	if response.Operation != "" ||
+		response.ReceiptKind != "" ||
+		response.Offset != 0 ||
+		response.Length != 0 ||
+		response.AddressSpace != (CasimirAuthorityID{}) ||
+		response.GuestPageIndex != 0 {
+		return reject("receipt acknowledgement fields on fault response")
 	}
 	switch response.FaultAction {
 	case "wake":
@@ -428,12 +442,20 @@ func acknowledgeCasimirStateRootFault(rw *bufio.ReadWriter, fault casimirFaultRe
 		acknowledgement.Zero ||
 		acknowledgement.FaultAction != "" ||
 		len(acknowledgement.Data) != 0 ||
-		acknowledgement.ExposureID != 0 ||
+		acknowledgement.Operation != receipt.Operation ||
+		acknowledgement.ReceiptKind != receipt.ReceiptKind ||
+		acknowledgement.ExposureID != receipt.ExposureID ||
+		acknowledgement.Offset != receipt.Offset ||
+		acknowledgement.Length != receipt.Length ||
+		acknowledgement.AddressSpace != receipt.AddressSpace ||
+		acknowledgement.GuestPageIndex != receipt.GuestPageIndex ||
 		len(acknowledgement.Regions) != 0 ||
 		len(acknowledgement.Layout.AddressSpaces) != 0 {
 		return fmt.Errorf(
-			"reject Casimir %s acknowledgement: continue=%t exposure_id=%d error=%q: %w",
+			"reject Casimir %s acknowledgement: operation=%q receipt_kind=%q continue=%t exposure_id=%d error=%q: %w",
 			receiptKind,
+			acknowledgement.Operation,
+			acknowledgement.ReceiptKind,
 			acknowledgement.Continue,
 			acknowledgement.ExposureID,
 			acknowledgement.Error,

@@ -45,7 +45,15 @@ func TestCasimirReadReturnsOnlyAfterExactExposureReceipt(t *testing.T) {
 			serverDone <- &unexpectedCasimirReceipt{receipt: receipt}
 			return
 		}
-		if err := json.NewEncoder(rw).Encode(casimirReadResponse{Continue: true}); err != nil {
+		if err := json.NewEncoder(rw).Encode(casimirReadResponse{
+			Operation:   receipt.Operation,
+			ReceiptKind: receipt.ReceiptKind,
+			Continue:    true,
+			ExposureID:  receipt.ExposureID,
+			Path:        receipt.Path,
+			Offset:      receipt.Offset,
+			Length:      receipt.Length,
+		}); err != nil {
 			serverDone <- err
 			return
 		}
@@ -65,36 +73,64 @@ func TestCasimirReadReturnsOnlyAfterExactExposureReceipt(t *testing.T) {
 	}
 }
 
-func TestCasimirReadWithholdsSuccessfulReturnWhenReceiptRejected(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	go func() {
-		defer serverConn.Close()
-		rw := bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn))
-		var request casimirReadRequest
-		if err := json.NewDecoder(rw).Decode(&request); err != nil {
-			return
-		}
-		if err := json.NewEncoder(rw).Encode(casimirReadResponse{
-			Data:       []byte("upper"),
-			ExposureID: 42,
-		}); err != nil {
-			return
-		}
-		if err := rw.Flush(); err != nil {
-			return
-		}
-		var receipt casimirExposureReceipt
-		if err := json.NewDecoder(rw).Decode(&receipt); err != nil {
-			return
-		}
-		_ = json.NewEncoder(rw).Encode(casimirReadResponse{Error: "receipt rejected"})
-		_ = rw.Flush()
-	}()
+func TestCasimirReadWithholdsSuccessfulReturnWhenReceiptAcknowledgementIsNotExact(t *testing.T) {
+	valid := casimirReadResponse{
+		Operation:   "state-root-receipt",
+		ReceiptKind: "vfs-read-return",
+		Continue:    true,
+		ExposureID:  42,
+		Path:        "renamed-new",
+		Offset:      3,
+		Length:      uint64(len("upper")),
+	}
+	tests := []struct {
+		name   string
+		mutate func(*casimirReadResponse)
+	}{
+		{name: "bare continue", mutate: func(a *casimirReadResponse) {
+			*a = casimirReadResponse{Continue: true}
+		}},
+		{name: "stale exposure", mutate: func(a *casimirReadResponse) { a.ExposureID-- }},
+		{name: "out of order kind", mutate: func(a *casimirReadResponse) { a.ReceiptKind = "page-installed" }},
+		{name: "mismatched path", mutate: func(a *casimirReadResponse) { a.Path = "other" }},
+		{name: "mismatched offset", mutate: func(a *casimirReadResponse) { a.Offset++ }},
+		{name: "mismatched length", mutate: func(a *casimirReadResponse) { a.Length++ }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer clientConn.Close()
+			go func() {
+				defer serverConn.Close()
+				rw := bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn))
+				var request casimirReadRequest
+				if err := json.NewDecoder(rw).Decode(&request); err != nil {
+					return
+				}
+				if err := json.NewEncoder(rw).Encode(casimirReadResponse{
+					Data:       []byte("upper"),
+					ExposureID: 42,
+				}); err != nil {
+					return
+				}
+				if err := rw.Flush(); err != nil {
+					return
+				}
+				var receipt casimirExposureReceipt
+				if err := json.NewDecoder(rw).Decode(&receipt); err != nil {
+					return
+				}
+				acknowledgement := valid
+				test.mutate(&acknowledgement)
+				_ = json.NewEncoder(rw).Encode(acknowledgement)
+				_ = rw.Flush()
+			}()
 
-	n, err := newCasimirDataClient(clientConn).read("renamed-new", make([]byte, len("upper")), 0)
-	if err == nil || n != 0 {
-		t.Fatalf("read() = (%d, %v), want fail-closed no successful return", n, err)
+			n, err := newCasimirDataClient(clientConn).read("renamed-new", make([]byte, len("upper")), 3)
+			if err == nil || n != 0 {
+				t.Fatalf("read() = (%d, %v), want fail-closed no successful return", n, err)
+			}
+		})
 	}
 }
 

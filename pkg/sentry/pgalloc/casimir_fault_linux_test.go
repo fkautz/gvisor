@@ -35,6 +35,19 @@ type recordingCasimirFaultSyscalls struct {
 	closedFDs     []int
 }
 
+func casimirFaultAcknowledgement(receipt casimirFaultRequest) casimirFaultResponse {
+	return casimirFaultResponse{
+		Operation:      receipt.Operation,
+		ReceiptKind:    receipt.ReceiptKind,
+		Continue:       true,
+		ExposureID:     receipt.ExposureID,
+		Offset:         receipt.Offset,
+		Length:         receipt.Length,
+		AddressSpace:   receipt.AddressSpace,
+		GuestPageIndex: receipt.GuestPageIndex,
+	}
+}
+
 func (s *recordingCasimirFaultSyscalls) userfaultfd(flags uintptr) (uintptr, error) {
 	s.openedFlags = flags
 	if s.openErr != nil {
@@ -573,7 +586,7 @@ func TestResolveCasimirStateRootFaultInstallsReceiptsThenResumesExactFault(t *te
 				serverDone <- fmt.Errorf("unexpected %s receipt: %+v", kind, receipt)
 				return
 			}
-			if err := encoder.Encode(casimirFaultResponse{Continue: true}); err != nil {
+			if err := encoder.Encode(casimirFaultAcknowledgement(receipt)); err != nil {
 				serverDone <- err
 				return
 			}
@@ -603,6 +616,164 @@ func TestResolveCasimirStateRootFaultInstallsReceiptsThenResumesExactFault(t *te
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResolveCasimirStateRootFaultWithholdsWakeWhenInstallAcknowledgementIsNotExact(t *testing.T) {
+	identity := CasimirAuthorityID{1}
+	tests := []struct {
+		name   string
+		mutate func(*casimirFaultResponse)
+	}{
+		{
+			name: "bare continue",
+			mutate: func(ack *casimirFaultResponse) {
+				*ack = casimirFaultResponse{Continue: true}
+			},
+		},
+		{
+			name: "stale exposure",
+			mutate: func(ack *casimirFaultResponse) {
+				ack.ExposureID--
+			},
+		},
+		{
+			name: "out of order kind",
+			mutate: func(ack *casimirFaultResponse) {
+				ack.ReceiptKind = "fault-resumed"
+			},
+		},
+		{
+			name: "mismatched address space",
+			mutate: func(ack *casimirFaultResponse) {
+				ack.AddressSpace = CasimirAuthorityID{2}
+			},
+		},
+		{
+			name: "mismatched guest page",
+			mutate: func(ack *casimirFaultResponse) {
+				ack.GuestPageIndex++
+			},
+		},
+		{
+			name: "mismatched offset",
+			mutate: func(ack *casimirFaultResponse) {
+				ack.Offset += 4096
+			},
+		},
+		{
+			name: "mismatched length",
+			mutate: func(ack *casimirFaultResponse) {
+				ack.Length /= 2
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, client := net.Pipe()
+			defer client.Close()
+			go func() {
+				defer server.Close()
+				decoder := json.NewDecoder(server)
+				encoder := json.NewEncoder(server)
+				var fault casimirFaultRequest
+				if err := decoder.Decode(&fault); err != nil {
+					return
+				}
+				if err := encoder.Encode(casimirFaultResponse{
+					Data:        bytes.Repeat([]byte{0x6b}, 4096),
+					FaultAction: "copy",
+					ExposureID:  74,
+				}); err != nil {
+					return
+				}
+				var receipt casimirFaultRequest
+				if err := decoder.Decode(&receipt); err != nil {
+					return
+				}
+				ack := casimirFaultAcknowledgement(receipt)
+				test.mutate(&ack)
+				_ = encoder.Encode(ack)
+			}()
+
+			rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+			wakeup := &recordingCasimirWakeup{}
+			err := resolveCasimirStateRootFault(
+				rw,
+				wakeup,
+				casimirFaultQualifier{
+					offset:         8192,
+					addressSpace:   identity,
+					guestPageIndex: 9,
+				},
+				"missing",
+				8192,
+				0x12345,
+				4096,
+			)
+			if err == nil {
+				t.Fatal("resolveCasimirStateRootFault() error = nil, want acknowledgement rejection")
+			}
+			if got := strings.Join(wakeup.calls, ","); got != "install" {
+				t.Fatalf("native fault boundary calls = %q, want install without wake", got)
+			}
+		})
+	}
+}
+
+func TestResolveCasimirStateRootFaultRejectsDuplicateInstallAcknowledgementForResume(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	identity := CasimirAuthorityID{1}
+	go func() {
+		defer server.Close()
+		decoder := json.NewDecoder(server)
+		encoder := json.NewEncoder(server)
+		var fault casimirFaultRequest
+		if err := decoder.Decode(&fault); err != nil {
+			return
+		}
+		if err := encoder.Encode(casimirFaultResponse{
+			Data:        bytes.Repeat([]byte{0x6b}, 4096),
+			FaultAction: "copy",
+			ExposureID:  75,
+		}); err != nil {
+			return
+		}
+		var installReceipt casimirFaultRequest
+		if err := decoder.Decode(&installReceipt); err != nil {
+			return
+		}
+		if err := encoder.Encode(casimirFaultAcknowledgement(installReceipt)); err != nil {
+			return
+		}
+		var resumeReceipt casimirFaultRequest
+		if err := decoder.Decode(&resumeReceipt); err != nil {
+			return
+		}
+		_ = encoder.Encode(casimirFaultAcknowledgement(installReceipt))
+	}()
+
+	rw := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	wakeup := &recordingCasimirWakeup{}
+	err := resolveCasimirStateRootFault(
+		rw,
+		wakeup,
+		casimirFaultQualifier{
+			offset:         8192,
+			addressSpace:   identity,
+			guestPageIndex: 9,
+		},
+		"missing",
+		8192,
+		0x12345,
+		4096,
+	)
+	if err == nil {
+		t.Fatal("resolveCasimirStateRootFault() error = nil, want duplicate acknowledgement rejection")
+	}
+	if got := strings.Join(wakeup.calls, ","); got != "install,wake" {
+		t.Fatalf("native fault boundary calls = %q, want install,wake before resume acknowledgement rejection", got)
 	}
 }
 

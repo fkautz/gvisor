@@ -91,10 +91,15 @@ type casimirReadRequest struct {
 }
 
 type casimirReadResponse struct {
-	Data       []byte `json:"data,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Continue   bool   `json:"continue,omitempty"`
-	ExposureID uint64 `json:"exposure_id,omitempty"`
+	Operation   string `json:"operation,omitempty"`
+	ReceiptKind string `json:"receipt_kind,omitempty"`
+	Data        []byte `json:"data,omitempty"`
+	Error       string `json:"error,omitempty"`
+	Continue    bool   `json:"continue,omitempty"`
+	ExposureID  uint64 `json:"exposure_id,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Offset      uint64 `json:"offset,omitempty"`
+	Length      uint64 `json:"length,omitempty"`
 }
 
 type casimirExposureReceipt struct {
@@ -159,9 +164,17 @@ func (c *casimirDataClient) read(path string, dst []byte, off uint64) (uint64, e
 			return 0, fmt.Errorf("decode Casimir VFS read-return acknowledgement: %w", err)
 		}
 		if acknowledgement.Error != "" || !acknowledgement.Continue ||
-			len(acknowledgement.Data) != 0 || acknowledgement.ExposureID != 0 {
+			len(acknowledgement.Data) != 0 ||
+			acknowledgement.Operation != receipt.Operation ||
+			acknowledgement.ReceiptKind != receipt.ReceiptKind ||
+			acknowledgement.ExposureID != receipt.ExposureID ||
+			acknowledgement.Path != receipt.Path ||
+			acknowledgement.Offset != receipt.Offset ||
+			acknowledgement.Length != receipt.Length {
 			return 0, fmt.Errorf(
-				"reject Casimir VFS read-return acknowledgement: continue=%t exposure_id=%d error=%q",
+				"reject Casimir VFS read-return acknowledgement: operation=%q receipt_kind=%q continue=%t exposure_id=%d error=%q",
+				acknowledgement.Operation,
+				acknowledgement.ReceiptKind,
 				acknowledgement.Continue,
 				acknowledgement.ExposureID,
 				acknowledgement.Error,
