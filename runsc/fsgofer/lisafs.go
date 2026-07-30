@@ -137,6 +137,20 @@ func (c *casimirDataClient) read(path string, dst []byte, off uint64) (uint64, e
 	if err := json.NewDecoder(c.rw).Decode(&response); err != nil {
 		return 0, err
 	}
+	if response.Operation != "" ||
+		response.ReceiptKind != "" ||
+		response.Continue ||
+		response.Path != "" ||
+		response.Offset != 0 ||
+		response.Length != 0 {
+		return 0, fmt.Errorf(
+			"reject receipt acknowledgement fields on Casimir VFS read response: operation=%q receipt_kind=%q continue=%t exposure_id=%d",
+			response.Operation,
+			response.ReceiptKind,
+			response.Continue,
+			response.ExposureID,
+		)
+	}
 	if response.Error != "" {
 		return 0, fmt.Errorf("casimir fs-plane read: %s", response.Error)
 	}
