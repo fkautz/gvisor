@@ -137,8 +137,11 @@ func statusError(status byte) error {
 	}
 }
 
+// appendPath encodes one path. THE EMPTY PATH IS VALID AND MEANS THE ROOT: an
+// LLIFS path is relative with no leading separator, so the served root has no
+// name at all.
 func appendPath(request []byte, path string) ([]byte, error) {
-	if len(path) == 0 || len(path) > maxPathBytes {
+	if len(path) > maxPathBytes {
 		return nil, unix.ENAMETOOLONG
 	}
 	request = binary.BigEndian.AppendUint16(request, uint16(len(path)))
@@ -277,4 +280,53 @@ func (c *client) ReadLink(path string) (string, error) {
 		return "", unix.EIO
 	}
 	return string(payload[2 : 2+length]), nil
+}
+
+// fdConn is a blocking byte stream over an already-connected raw descriptor.
+//
+// IT DELIBERATELY AVOIDS net.FileConn. That constructor issues getsockopt to
+// learn the socket type and then registers the descriptor with Go's netpoller,
+// and the gofer installs its seccomp filter before mount dispatch -- so the
+// very first getsockopt killed the gofer with SIGSYS. That produces no panic
+// and no log line: the Sentry saw "connection reset by peer" and the operator
+// saw "mounting root with overlay: input/output error". The cause was read out
+// of a kernel audit record (type=1326 sig=31 syscall=55), not guessed.
+//
+// read(2) and write(2) on a connected blocking descriptor need nothing the
+// stock gofer filter does not already allow.
+type fdConn struct {
+	fd int
+}
+
+func (c *fdConn) Read(buf []byte) (int, error) {
+	for {
+		n, err := unix.Read(c.fd, buf)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if n == 0 && len(buf) > 0 {
+			// A stream socket returns zero only at end of stream. Reporting it
+			// as a successful empty read would spin io.ReadFull forever.
+			return 0, io.EOF
+		}
+		return n, nil
+	}
+}
+
+func (c *fdConn) Write(buf []byte) (int, error) {
+	written := 0
+	for written < len(buf) {
+		n, err := unix.Write(c.fd, buf[written:])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return written, err
+		}
+		written += n
+	}
+	return written, nil
 }

@@ -17,7 +17,6 @@ package casimir
 import (
 	"fmt"
 	"net"
-	"os"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -45,8 +44,8 @@ func init() {
 
 // Extension serves a container root from Casimir's store.
 type Extension struct {
-	// storeFD is the already-connected socket, passed across the gofer's
-	// capability re-exec by PrepareGofer.
+	// storeFD is the already-connected socket, donated to the gofer by the
+	// runsc process that spawned it.
 	storeFD int
 }
 
@@ -55,48 +54,50 @@ var _ extension.Extension = (*Extension)(nil)
 // Name implements extension.Extension.Name.
 func (e *Extension) Name() string { return "casimir" }
 
-// SetFlags registers the descriptor flag PrepareGofer overrides.
+// storeFDFlag names the gofer subcommand flag carrying the donated descriptor.
+// PrepareGoferHost donates under this exact name and SetFlags reads it back;
+// the two must agree or the gofer holds a descriptor it cannot find.
+const storeFDFlag = "casimir-store-fd"
+
+// SetFlags registers the descriptor flag the donation lands in.
 func (e *Extension) SetFlags(f *flag.FlagSet) {
-	f.IntVar(&e.storeFD, "casimir-store-fd", -1, "file descriptor of a connected Casimir store socket")
+	f.IntVar(&e.storeFD, storeFDFlag, -1, "file descriptor of a connected Casimir store socket")
 }
 
-// PrepareGofer dials the store BEFORE the gofer drops capabilities and enters
-// its final root, then hands the descriptor across the re-exec.
+// PrepareGoferHost dials the store in the runsc process that spawns the gofer
+// and donates the connected socket.
 //
-// THE dup(2) IS NOT OPTIONAL. Go sets FD_CLOEXEC on everything it opens, so the
-// dialed connection would not survive the re-exec; dup(2) returns a descriptor
-// with the flag clear, which is exactly what FlagOverrides documents it needs.
-// Getting this wrong produces no error here and an EIO from the Sentry later,
-// naming nothing.
-func (e *Extension) PrepareGofer(ctx extension.GoferPrepareContext) (extension.GoferPrepareResult, error) {
+// IT CANNOT BE DONE IN THE GOFER. The store is named by a host path, and the
+// gofer's own PrepareGofer hook runs after it has unshared its mount namespace
+// and built the root it chroots into, so the path no longer resolves there --
+// observed as `dial casimir store ".../bridge.sock": no such file or directory`,
+// reaching the operator two layers away as an unmarshaling error on the boot
+// side. Dialing here needs no dup(2): the descriptor travels as an ExtraFile,
+// so the child receives it with FD_CLOEXEC clear and it survives the gofer's
+// capability re-exec.
+func (e *Extension) PrepareGoferHost(ctx extension.HostPrepareContext) (extension.HostPrepareResult, error) {
 	socket, ok := ctx.Spec.Annotations[SocketAnnotation]
 	if !ok || socket == "" {
-		return extension.GoferPrepareResult{}, nil
+		return extension.HostPrepareResult{}, nil
 	}
 	conn, err := net.Dial("unix", socket)
 	if err != nil {
-		return extension.GoferPrepareResult{}, fmt.Errorf("dial casimir store %q: %w", socket, err)
+		return extension.HostPrepareResult{}, fmt.Errorf("dial casimir store %q: %w", socket, err)
 	}
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
 		conn.Close()
-		return extension.GoferPrepareResult{}, fmt.Errorf("casimir store %q is not a unix socket", socket)
+		return extension.HostPrepareResult{}, fmt.Errorf("casimir store %q is not a unix socket", socket)
 	}
+	// File() returns a duplicate; the original conn is closed because only the
+	// duplicate is donated.
 	file, err := unixConn.File()
-	if err != nil {
-		conn.Close()
-		return extension.GoferPrepareResult{}, fmt.Errorf("take casimir store descriptor: %w", err)
-	}
-	// The *os.File and the original conn are both closed: only the duplicate,
-	// with FD_CLOEXEC cleared, is meant to survive.
-	duplicated, err := unix.Dup(int(file.Fd()))
-	file.Close()
 	unixConn.Close()
 	if err != nil {
-		return extension.GoferPrepareResult{}, fmt.Errorf("dup casimir store descriptor: %w", err)
+		return extension.HostPrepareResult{}, fmt.Errorf("take casimir store descriptor: %w", err)
 	}
-	return extension.GoferPrepareResult{
-		FlagOverrides: map[string]string{"casimir-store-fd": fmt.Sprintf("%d", duplicated)},
+	return extension.HostPrepareResult{
+		Donations: []extension.GoferDonation{{Flag: storeFDFlag, File: file}},
 	}, nil
 }
 
@@ -116,11 +117,7 @@ func (e *Extension) TryHandleMount(spec *specs.Spec, mount *specs.Mount, mountPa
 			"casimir store socket %q was configured but no descriptor survived the gofer re-exec",
 			spec.Annotations[SocketAnnotation])
 	}
-	conn, err := net.FileConn(os.NewFile(uintptr(e.storeFD), "casimir-store"))
-	if err != nil {
-		return nil, lisafs.ConnectionOpts{}, fmt.Errorf("adopt casimir store descriptor: %w", err)
-	}
-	return &connection{client: &client{conn: conn}}, lisafs.ConnectionOpts{
+	return &connection{client: &client{conn: &fdConn{fd: e.storeFD}}}, lisafs.ConnectionOpts{
 		// The served root is read-only regardless of what the spec says: these
 		// bytes are verified content-addressed state, and the writable upper is
 		// the runtime's own overlay.
@@ -130,20 +127,19 @@ func (e *Extension) TryHandleMount(spec *specs.Spec, mount *specs.Mount, mountPa
 	}, nil
 }
 
-// SeccompRules allows the syscalls the store connection needs.
+// SeccompRules allows the syscalls the store connection needs, which is only
+// read and write.
 //
-// IT IS NOT OPTIONAL FOR A SOCKET-BACKED BACKEND. net.FileConn issues fcntl to
-// set O_NONBLOCK, and the gofer's filter installs before mount dispatch. Without
-// fcntl the gofer dies on SIGSYS with no panic and no log -- just an EIO from
-// the Sentry. That failure was diagnosed from a kernel audit record
-// (type=1326 sig=31 syscall=72), not guessed.
+// THAT SHORT LIST IS THE POINT, and it is why fdConn exists. The gofer's filter
+// is installed before mount dispatch, so every syscall a backend makes while
+// serving must already be allowed; a backend that reaches for the net package
+// pulls in getsockopt, getsockname, and the netpoller's epoll calls, and each
+// missing one kills the gofer with SIGSYS -- no panic, no log, and an EIO two
+// layers away. read and write are already in the stock allowlist; naming them
+// here documents the dependency rather than widening anything.
 func (e *Extension) SeccompRules() seccomp.SyscallRules {
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-		unix.SYS_FCNTL:    seccomp.MatchAll{},
-		unix.SYS_READ:     seccomp.MatchAll{},
-		unix.SYS_WRITE:    seccomp.MatchAll{},
-		unix.SYS_PPOLL:    seccomp.MatchAll{},
-		unix.SYS_RECVFROM: seccomp.MatchAll{},
-		unix.SYS_SENDTO:   seccomp.MatchAll{},
+		unix.SYS_READ:  seccomp.MatchAll{},
+		unix.SYS_WRITE: seccomp.MatchAll{},
 	})
 }

@@ -46,11 +46,17 @@ var _ lisafs.ConnectionImpl = (*connection)(nil)
 
 // Mount attaches the served root.
 func (c *connection) Mount(conn *lisafs.Connection, mountNode *lisafs.Node) (*lisafs.ControlFD, lisafs.Statx, int, error) {
-	attr, err := c.client.Stat(".")
+	// THE ROOT IS THE EMPTY PATH, not ".". LLIFS canonical paths are relative
+	// with no leading separator, and normalization drops "." components, so the
+	// root entry the store publishes is literally the zero-length path. Sending
+	// "." asks for a child named "." that no rootfs contains, and the store
+	// answers "not found" -- which reaches the operator as "mounting root with
+	// overlay: no such file or directory", naming nothing.
+	attr, err := c.client.Stat("")
 	if err != nil {
 		return nil, lisafs.Statx{}, -1, err
 	}
-	root := &controlFD{conn: c, path: "."}
+	root := &controlFD{conn: c, path: ""}
 	mountNode.IncRef() // Ref is transferred to the ControlFD.
 	root.ControlFD.Init(conn, mountNode, linux.FileMode(attr.Mode), root)
 	// No host FD is donated: there is no host file behind these bytes, which is
