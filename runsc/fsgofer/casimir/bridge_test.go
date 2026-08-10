@@ -74,6 +74,7 @@ func TestClientStatParsesTheStoreReply(t *testing.T) {
 	payload = binary.BigEndian.AppendUint32(payload, 7)
 	payload = binary.BigEndian.AppendUint32(payload, 11)
 	payload = append(payload, 1)
+	payload = binary.BigEndian.AppendUint64(payload, 42)
 	store := &fakeStore{responses: [][]byte{frame(payload)}}
 	c := &client{conn: store}
 
@@ -83,6 +84,9 @@ func TestClientStatParsesTheStoreReply(t *testing.T) {
 	}
 	if attr.Size != 4096 || attr.Mode != 0o100644 || attr.UID != 7 || attr.GID != 11 || !attr.Regular {
 		t.Fatalf("Stat() = %+v, want size 4096 mode 0100644 uid 7 gid 11 regular", attr)
+	}
+	if attr.Ino != 42 {
+		t.Fatalf("Stat() Ino = %d, want 42", attr.Ino)
 	}
 	if len(store.requests) != 1 || store.requests[0][0] != opStat {
 		t.Fatalf("request opcode = %v, want opStat", store.requests[0][0])
@@ -128,7 +132,10 @@ func TestClientReadDirParsesAPageAndItsResumeIndex(t *testing.T) {
 		out = binary.BigEndian.AppendUint32(out, 0o040755)
 		out = binary.BigEndian.AppendUint32(out, 0)
 		out = binary.BigEndian.AppendUint32(out, 0)
-		return binary.BigEndian.AppendUint64(out, 0)
+		out = binary.BigEndian.AppendUint64(out, 0)
+		// A distinct non-zero identifier per name: zero is what the client must
+		// refuse, and equal values are what alias one file onto another.
+		return binary.BigEndian.AppendUint64(out, uint64(name[0]))
 	}
 	payload := []byte{statusOK, 1}
 	payload = binary.BigEndian.AppendUint32(payload, 2)
@@ -177,5 +184,42 @@ func TestClientReadLinkReturnsTheRawTarget(t *testing.T) {
 	}
 	if got != target {
 		t.Fatalf("ReadLink() = %q, want %q unresolved", got, target)
+	}
+}
+
+// TestClientRefusesAZeroIdentifier proves the relay will not forward the one
+// value that makes every file the same file.
+//
+// A store that cannot identify a file must not have that silently turned into
+// "identical to everything else": the Sentry keys its inode cache on this
+// number, so a zero would resurface as one file's bytes served under another
+// file's name, arbitrarily far from here.
+func TestClientRefusesAZeroIdentifier(t *testing.T) {
+	stat := []byte{statusOK}
+	stat = binary.BigEndian.AppendUint64(stat, 4096)
+	stat = binary.BigEndian.AppendUint32(stat, 0o100644)
+	stat = binary.BigEndian.AppendUint32(stat, 0)
+	stat = binary.BigEndian.AppendUint32(stat, 0)
+	stat = append(stat, 1)
+	stat = binary.BigEndian.AppendUint64(stat, 0)
+	c := &client{conn: &fakeStore{responses: [][]byte{frame(stat)}}}
+	if _, err := c.Stat("bin/sh"); !errors.Is(err, unix.EIO) {
+		t.Errorf("Stat() with a zero identifier = %v, want EIO", err)
+	}
+
+	entry := binary.BigEndian.AppendUint16(nil, 1)
+	entry = append(entry, 'a')
+	entry = binary.BigEndian.AppendUint32(entry, 0o100644)
+	entry = binary.BigEndian.AppendUint32(entry, 0)
+	entry = binary.BigEndian.AppendUint32(entry, 0)
+	entry = binary.BigEndian.AppendUint64(entry, 0)
+	entry = binary.BigEndian.AppendUint64(entry, 0)
+	page := []byte{statusOK, 0}
+	page = binary.BigEndian.AppendUint32(page, 1)
+	page = binary.BigEndian.AppendUint16(page, 1)
+	page = append(page, entry...)
+	c = &client{conn: &fakeStore{responses: [][]byte{frame(page)}}}
+	if _, _, _, err := c.ReadDir("srv", 0); !errors.Is(err, unix.EIO) {
+		t.Errorf("ReadDir() with a zero identifier = %v, want EIO", err)
 	}
 }

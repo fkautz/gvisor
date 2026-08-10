@@ -69,6 +69,17 @@ type Attr struct {
 	UID     uint32
 	GID     uint32
 	Regular bool
+
+	// Ino is the store's stable identifier for this file, never zero.
+	//
+	// IT IS LOAD-BEARING, not decoration. The Sentry's gofer client keys its
+	// inode cache on inoKey{Ino, DevMinor, DevMajor} and shares one inode
+	// across every dentry with an equal key, so publishing zero for every file
+	// makes every file in the mount the same file -- the second name walked in
+	// a directory serves the first one's contents and size. A content-addressed
+	// store has no host inode, so this comes from the store's canonical entry
+	// order instead.
+	Ino uint64
 }
 
 // Dirent is one directory entry as the store reports it.
@@ -78,6 +89,7 @@ type Dirent struct {
 	UID  uint32
 	GID  uint32
 	Size uint64
+	Ino  uint64
 }
 
 // client is a strictly request/response connection to the store.
@@ -161,7 +173,14 @@ func (c *client) Stat(path string) (Attr, error) {
 	if status != statusOK {
 		return Attr{}, statusError(status)
 	}
-	if len(payload) < 8+4+4+4+1 {
+	if len(payload) < 8+4+4+4+1+8 {
+		return Attr{}, unix.EIO
+	}
+	ino := binary.BigEndian.Uint64(payload[21:29])
+	if ino == 0 {
+		// Zero is the store saying it has no identifier, and it is the exact
+		// value that aliases every file onto one inode. Refuse rather than serve
+		// a name whose contents cannot be trusted to be its own.
 		return Attr{}, unix.EIO
 	}
 	return Attr{
@@ -170,6 +189,7 @@ func (c *client) Stat(path string) (Attr, error) {
 		UID:     binary.BigEndian.Uint32(payload[12:16]),
 		GID:     binary.BigEndian.Uint32(payload[16:20]),
 		Regular: payload[20] == 1,
+		Ino:     ino,
 	}, nil
 }
 
@@ -237,7 +257,7 @@ func (c *client) ReadDir(path string, start uint32) (entries []Dirent, next uint
 			return nil, 0, false, unix.EIO
 		}
 		nameLen := int(binary.BigEndian.Uint16(rest[:2]))
-		if nameLen == 0 || len(rest) < 2+nameLen+4+4+4+8 {
+		if nameLen == 0 || len(rest) < 2+nameLen+4+4+4+8+8 {
 			return nil, 0, false, unix.EIO
 		}
 		entry := Dirent{Name: string(rest[2 : 2+nameLen])}
@@ -246,7 +266,11 @@ func (c *client) ReadDir(path string, start uint32) (entries []Dirent, next uint
 		entry.UID = binary.BigEndian.Uint32(rest[4:8])
 		entry.GID = binary.BigEndian.Uint32(rest[8:12])
 		entry.Size = binary.BigEndian.Uint64(rest[12:20])
-		rest = rest[20:]
+		entry.Ino = binary.BigEndian.Uint64(rest[20:28])
+		if entry.Ino == 0 {
+			return nil, 0, false, unix.EIO
+		}
+		rest = rest[28:]
 		entries = append(entries, entry)
 	}
 	if len(rest) != 0 {

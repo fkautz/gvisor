@@ -90,9 +90,15 @@ func (c *connection) SupportedMessages() []lisafs.MID {
 	}
 }
 
+// statxFromAttr carries the store's identifier through as the inode number.
+//
+// WITHOUT STATX_INO THE MASK LIES BY OMISSION and the client falls back to its
+// own numbering; with Ino left zero every file collapses onto one cached inode.
+// Both halves are required.
 func statxFromAttr(attr Attr) lisafs.Statx {
 	return lisafs.Statx{
-		Mask:    unix.STATX_TYPE | unix.STATX_MODE | unix.STATX_UID | unix.STATX_GID | unix.STATX_SIZE | unix.STATX_NLINK,
+		Mask:    unix.STATX_TYPE | unix.STATX_MODE | unix.STATX_UID | unix.STATX_GID | unix.STATX_SIZE | unix.STATX_NLINK | unix.STATX_INO,
+		Ino:     attr.Ino,
 		Mode:    uint16(attr.Mode),
 		UID:     attr.UID,
 		GID:     attr.GID,
@@ -378,7 +384,7 @@ func (fd *openFD) Getdent64(count uint32, seek0 bool, recordDirent func(lisafs.D
 				break
 			}
 			recordDirent(lisafs.Dirent64{
-				Ino:  primitive.Uint64(0),
+				Ino:  primitive.Uint64(entry.Ino),
 				Off:  primitive.Uint64(uint64(fd.next) + 1),
 				Type: primitive.Uint8(direntType(entry.Mode)),
 				Name: lisafs.SizedString(entry.Name),
