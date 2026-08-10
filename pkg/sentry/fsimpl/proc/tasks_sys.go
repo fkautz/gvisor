@@ -16,6 +16,7 @@ package proc
 
 import (
 	"bytes"
+	goContext "context"
 	"fmt"
 	"io"
 	"math"
@@ -58,7 +59,7 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"pid_max":            fs.newInode(ctx, root, 0644, newStaticFile(fmt.Sprintf("%d\n", kernel.TasksLimit))),
 			"randomize_va_space": fs.newInode(ctx, root, 0644, newStaticFile("2\n")),
 			"random": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-				"boot_id": fs.newInode(ctx, root, 0444, newStaticFile(randUUID())),
+				"boot_id": fs.newInode(ctx, root, 0444, newBootIDData()),
 				"uuid":    fs.newInode(ctx, root, 0444, &uuidData{}),
 			}),
 			"sem":    fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\t%d\t%d\t%d\n", linux.SEMMSL, linux.SEMMNS, linux.SEMOPM, linux.SEMMNI))),
@@ -236,6 +237,45 @@ var _ dynamicInode = (*uuidData)(nil)
 func (*uuidData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString(randUUID())
 	return nil
+}
+
+// bootIDData implements vfs.DynamicBytesSource for
+// /proc/sys/kernel/random/boot_id.
+//
+// It sits deliberately between the two neighbouring patterns. Unlike uuidData
+// it is STABLE: boot_id names the running kernel instance, so repeated reads
+// within one boot must agree. Unlike a staticFile it is REGENERATED ON
+// RESTORE, because a restored sandbox is a new boot. That distinction only
+// becomes observable with checkpoint/restore: a staticFile's bytes are part of
+// saved state, so every sandbox restored from one checkpoint served an
+// identical boot_id and each would claim to be the same machine as its
+// siblings.
+//
+// +stateify savable
+type bootIDData struct {
+	kernfs.DynamicBytesFile
+
+	// id is the current boot's identifier. It is replaced on restore and is
+	// otherwise immutable, so reads need no synchronization: afterLoad runs
+	// before the restored sandbox schedules any task.
+	id string
+}
+
+var _ dynamicInode = (*bootIDData)(nil)
+
+func newBootIDData() *bootIDData {
+	return &bootIDData{id: randUUID()}
+}
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (b *bootIDData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	buf.WriteString(b.id)
+	return nil
+}
+
+// afterLoad is invoked by stateify.
+func (b *bootIDData) afterLoad(goContext.Context) {
+	b.id = randUUID()
 }
 
 // GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
