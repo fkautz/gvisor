@@ -7,9 +7,15 @@ package(
 
 go_library(
     name = "casimir",
-    srcs = ["bridge.go"],
+    srcs = [
+        "bridge.go",
+        "lisafs.go",
+    ],
     visibility = ["//runsc:__subpackages__"],
     deps = [
+        "//pkg/abi/linux",
+        "//pkg/lisafs",
+        "//pkg/marshal/primitive",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
