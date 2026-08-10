@@ -35,6 +35,7 @@ go_library(
         "//runsc/config",
         "//runsc/console",
         "//runsc/donation",
+        "//runsc/fsgofer/extension",
         "//runsc/profile",
         "//runsc/sandbox",
         "//runsc/specutils",

@@ -16,6 +16,8 @@ package extension
 
 import (
 	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -134,5 +136,140 @@ func TestPrepareGoferError(t *testing.T) {
 
 	if _, err := PrepareGofer(GoferPrepareContext{}); !errors.Is(err, want) {
 		t.Fatalf("PrepareGofer error = %v, want %v", err, want)
+	}
+}
+
+type hostPrepareExtension struct {
+	fakeExtension
+	prepareGoferHost func(HostPrepareContext) (HostPrepareResult, error)
+}
+
+func (f hostPrepareExtension) PrepareGoferHost(ctx HostPrepareContext) (HostPrepareResult, error) {
+	if f.prepareGoferHost == nil {
+		return HostPrepareResult{}, nil
+	}
+	return f.prepareGoferHost(ctx)
+}
+
+// newTestFile returns an open file whose closed-ness a test can observe.
+func newTestFile(t *testing.T) *os.File {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		read.Close()
+		write.Close()
+	})
+	return write
+}
+
+func isClosed(f *os.File) bool {
+	_, err := f.Write([]byte{0})
+	return errors.Is(err, os.ErrClosed)
+}
+
+func TestPrepareGoferHost(t *testing.T) {
+	registered = nil
+
+	first := newTestFile(t)
+	second := newTestFile(t)
+	Register(fakeExtension{name: "plain"})
+	Register(hostPrepareExtension{
+		fakeExtension: fakeExtension{name: "second"},
+		prepareGoferHost: func(ctx HostPrepareContext) (HostPrepareResult, error) {
+			if ctx.ContainerID != "container" || ctx.BundleDir != "/bundle" {
+				t.Fatalf("HostPrepareContext = %+v", ctx)
+			}
+			return HostPrepareResult{Donations: []GoferDonation{{Flag: "first-fd", File: first}}}, nil
+		},
+	})
+	Register(hostPrepareExtension{
+		fakeExtension: fakeExtension{name: "third"},
+		prepareGoferHost: func(HostPrepareContext) (HostPrepareResult, error) {
+			return HostPrepareResult{Donations: []GoferDonation{{Flag: "second-fd", File: second}}}, nil
+		},
+	})
+
+	got, err := PrepareGoferHost(HostPrepareContext{ContainerID: "container", BundleDir: "/bundle"})
+	if err != nil {
+		t.Fatalf("PrepareGoferHost: %v", err)
+	}
+	// Order is registration order, so the flags the gofer receives do not
+	// depend on map iteration.
+	want := []GoferDonation{{Flag: "first-fd", File: first}, {Flag: "second-fd", File: second}}
+	if len(got.Donations) != len(want) {
+		t.Fatalf("PrepareGoferHost donations = %+v, want %+v", got.Donations, want)
+	}
+	for i := range want {
+		if got.Donations[i] != want[i] {
+			t.Fatalf("donation %d = %+v, want %+v", i, got.Donations[i], want[i])
+		}
+	}
+	// Ownership stays with the caller on success: closing here would hand the
+	// gofer a descriptor that is already gone.
+	if isClosed(first) || isClosed(second) {
+		t.Fatal("PrepareGoferHost closed a file it returned")
+	}
+}
+
+func TestPrepareGoferHostRejectsDuplicateFlag(t *testing.T) {
+	registered = nil
+
+	first := newTestFile(t)
+	second := newTestFile(t)
+	Register(hostPrepareExtension{
+		fakeExtension: fakeExtension{name: "first"},
+		prepareGoferHost: func(HostPrepareContext) (HostPrepareResult, error) {
+			return HostPrepareResult{Donations: []GoferDonation{{Flag: "store-fd", File: first}}}, nil
+		},
+	})
+	Register(hostPrepareExtension{
+		fakeExtension: fakeExtension{name: "second"},
+		prepareGoferHost: func(HostPrepareContext) (HostPrepareResult, error) {
+			return HostPrepareResult{Donations: []GoferDonation{{Flag: "store-fd", File: second}}}, nil
+		},
+	})
+
+	got, err := PrepareGoferHost(HostPrepareContext{})
+	if err == nil {
+		t.Fatalf("PrepareGoferHost = %+v, want an error", got)
+	}
+	// Both names must appear: the point of failing is telling the operator
+	// which two extensions collided.
+	if !strings.Contains(err.Error(), "first") || !strings.Contains(err.Error(), "second") || !strings.Contains(err.Error(), "store-fd") {
+		t.Errorf("error %q does not name both extensions and the flag", err)
+	}
+	if !isClosed(first) || !isClosed(second) {
+		t.Errorf("leaked descriptors: first closed=%v second closed=%v", isClosed(first), isClosed(second))
+	}
+}
+
+func TestPrepareGoferHostErrorClosesEarlierDonations(t *testing.T) {
+	registered = nil
+
+	first := newTestFile(t)
+	want := errors.New("dial failed")
+	Register(hostPrepareExtension{
+		fakeExtension: fakeExtension{name: "first"},
+		prepareGoferHost: func(HostPrepareContext) (HostPrepareResult, error) {
+			return HostPrepareResult{Donations: []GoferDonation{{Flag: "first-fd", File: first}}}, nil
+		},
+	})
+	Register(hostPrepareExtension{
+		fakeExtension: fakeExtension{name: "second"},
+		prepareGoferHost: func(HostPrepareContext) (HostPrepareResult, error) {
+			return HostPrepareResult{}, want
+		},
+	})
+
+	if _, err := PrepareGoferHost(HostPrepareContext{}); !errors.Is(err, want) {
+		t.Fatalf("PrepareGoferHost error = %v, want %v", err, want)
+	}
+	// A failed spawn must not leave the already-dialed connection open: the
+	// caller never gets the slice, so nothing else can close it.
+	if !isClosed(first) {
+		t.Error("PrepareGoferHost leaked an earlier extension's donation")
 	}
 }

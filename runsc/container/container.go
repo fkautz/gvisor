@@ -47,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/fsgofer/extension"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -1632,6 +1633,23 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	chrootSyncGoferEnd := os.NewFile(uintptr(fds[1]), "chroot sync gofer FD")
 	donations.DonateAndClose("sync-chroot-fd", chrootSyncGoferEnd)
 	defer chrootSyncSandEnd.Close()
+
+	// Let extensions open host resources that only resolve here. The gofer's
+	// own extension.PrepareGofer hook runs after the gofer has unshared its
+	// namespaces and prepared the root it chroots into, which is too late for
+	// anything named by a host path. These donations are transferred below,
+	// after the "gofer" argument, so they become gofer subcommand flags.
+	hostPrepare, err := extension.PrepareGoferHost(extension.HostPrepareContext{
+		Spec:        c.Spec,
+		ContainerID: c.ID,
+		BundleDir:   c.BundleDir,
+	})
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("preparing gofer extensions on the host: %w", err)
+	}
+	for _, d := range hostPrepare.Donations {
+		donations.DonateAndClose(d.Flag, d.File)
+	}
 
 	donations.Transfer(cmd, nextFD)
 

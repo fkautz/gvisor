@@ -17,6 +17,9 @@
 package extension
 
 import (
+	"fmt"
+	"os"
+
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -71,6 +74,44 @@ type prepareGofer interface {
 	PrepareGofer(ctx GoferPrepareContext) (GoferPrepareResult, error)
 }
 
+// HostPrepareContext contains inputs available in the process that spawns the
+// gofer, while that process still has the caller's mount namespace, root
+// directory, and host network access.
+//
+// PrepareGofer runs inside the gofer, after it has unshared its namespaces and
+// set up the root it will chroot into. An extension backed by a host resource
+// that is named by a path -- a service socket, for instance -- cannot open it
+// there, because the name no longer resolves. Such an extension must open it
+// here instead and donate the descriptor.
+type HostPrepareContext struct {
+	Spec        *specs.Spec
+	ContainerID string
+	BundleDir   string
+}
+
+// GoferDonation is one file passed from the spawning process to the gofer.
+type GoferDonation struct {
+	// Flag is the gofer subcommand flag that receives the descriptor number in
+	// the child. The extension must register it in SetFlags.
+	Flag string
+
+	// File is donated to the gofer. The spawning process takes ownership and
+	// closes it once the gofer has started; the descriptor the child receives
+	// has FD_CLOEXEC clear, so it also survives the gofer's capability re-exec.
+	File *os.File
+}
+
+// HostPrepareResult contains state the spawning process passes to the gofer.
+type HostPrepareResult struct {
+	// Donations are applied in order, so the flags they produce are
+	// deterministic across runs.
+	Donations []GoferDonation
+}
+
+type prepareGoferHost interface {
+	PrepareGoferHost(ctx HostPrepareContext) (HostPrepareResult, error)
+}
+
 var registered []Extension
 
 // Register adds e to the extension list. Must be called during init or
@@ -114,4 +155,48 @@ func PrepareGofer(ctx GoferPrepareContext) (GoferPrepareResult, error) {
 		}
 	}
 	return result, nil
+}
+
+// PrepareGoferHost lets registered extensions open host resources in the
+// spawning process and collects the files they donate to the gofer.
+//
+// Two extensions claiming the same flag is a configuration error, not a
+// last-one-wins merge: the loser's file would be donated with no flag naming
+// it, so the gofer would hold a descriptor it cannot find and the extension
+// would fail later with nothing pointing back here. On error the caller must
+// close every file returned so far; ownership does not transfer until the
+// caller donates them.
+func PrepareGoferHost(ctx HostPrepareContext) (HostPrepareResult, error) {
+	var result HostPrepareResult
+	claimed := make(map[string]string)
+	for _, e := range registered {
+		prepare, ok := e.(prepareGoferHost)
+		if !ok {
+			continue
+		}
+		extensionResult, err := prepare.PrepareGoferHost(ctx)
+		if err != nil {
+			closeDonations(result.Donations)
+			closeDonations(extensionResult.Donations)
+			return HostPrepareResult{}, fmt.Errorf("extension %q: %w", e.Name(), err)
+		}
+		for _, donation := range extensionResult.Donations {
+			if owner, ok := claimed[donation.Flag]; ok {
+				closeDonations(result.Donations)
+				closeDonations(extensionResult.Donations)
+				return HostPrepareResult{}, fmt.Errorf("extensions %q and %q both donate to flag %q", owner, e.Name(), donation.Flag)
+			}
+			claimed[donation.Flag] = e.Name()
+		}
+		result.Donations = append(result.Donations, extensionResult.Donations...)
+	}
+	return result, nil
+}
+
+func closeDonations(donations []GoferDonation) {
+	for _, donation := range donations {
+		if donation.File != nil {
+			_ = donation.File.Close()
+		}
+	}
 }
