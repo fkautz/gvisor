@@ -37,6 +37,9 @@ import (
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
 	"gvisor.dev/gvisor/runsc/fsgofer/extension"
+	// Registers the Casimir store backend. Blank-imported because the
+	// registration happens in its init; nothing here calls it directly.
+	_ "gvisor.dev/gvisor/runsc/fsgofer/casimir"
 	"gvisor.dev/gvisor/runsc/fsgofer/filter"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"

@@ -9,6 +9,7 @@ go_library(
     name = "casimir",
     srcs = [
         "bridge.go",
+        "extension.go",
         "lisafs.go",
     ],
     visibility = ["//runsc:__subpackages__"],
@@ -16,6 +17,10 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/lisafs",
         "//pkg/marshal/primitive",
+        "//pkg/seccomp",
+        "//runsc/flag",
+        "//runsc/fsgofer/extension",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

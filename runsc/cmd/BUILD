@@ -81,6 +81,7 @@ go_library(
         "//runsc/container",
         "//runsc/flag",
         "//runsc/fsgofer",
+        "//runsc/fsgofer/casimir",
         "//runsc/fsgofer/extension",
         "//runsc/fsgofer/filter",
         "//runsc/gvisorbinaries",
