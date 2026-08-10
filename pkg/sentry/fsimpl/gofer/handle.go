@@ -48,6 +48,15 @@ func (h *handle) close(ctx context.Context) {
 }
 
 func (h *handle) readToBlocksAt(ctx context.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error) {
+	return h.readToBlocksAtWithFlags(ctx, dsts, offset, 0)
+}
+
+// readToBlocksAtWithFlags is readToBlocksAt, telling the remote filesystem why
+// the read is happening. See lisafs.PReadFlag*.
+//
+// The hint is dropped when a host FD is available, because then no request
+// reaches the remote filesystem at all and there is nobody to tell.
+func (h *handle) readToBlocksAtWithFlags(ctx context.Context, dsts safemem.BlockSeq, offset uint64, flags uint32) (uint64, error) {
 	if dsts.IsEmpty() {
 		return 0, nil
 	}
@@ -57,7 +66,7 @@ func (h *handle) readToBlocksAt(ctx context.Context, dsts safemem.BlockSeq, offs
 		ctx.UninterruptibleSleepFinish()
 		return n, err
 	}
-	rw := getHandleReadWriter(ctx, h, int64(offset))
+	rw := getHandleReadWriterWithFlags(ctx, h, int64(offset), flags)
 	defer putHandleReadWriter(rw)
 	return safemem.FromIOReader{rw}.ReadToBlocks(dsts)
 }
@@ -117,9 +126,10 @@ func (h *handle) syncData(ctx context.Context) error {
 }
 
 type handleReadWriter struct {
-	ctx context.Context
-	h   handle
-	off uint64
+	ctx   context.Context
+	h     handle
+	off   uint64
+	flags uint32
 }
 
 var handleReadWriterPool = sync.Pool{
@@ -129,14 +139,22 @@ var handleReadWriterPool = sync.Pool{
 }
 
 func getHandleReadWriter(ctx context.Context, h *handle, offset int64) *handleReadWriter {
+	return getHandleReadWriterWithFlags(ctx, h, offset, 0)
+}
+
+func getHandleReadWriterWithFlags(ctx context.Context, h *handle, offset int64, flags uint32) *handleReadWriter {
 	rw := handleReadWriterPool.Get().(*handleReadWriter)
 	rw.ctx = ctx
 	rw.h = *h
 	rw.off = uint64(offset)
+	rw.flags = flags
 	return rw
 }
 
 func putHandleReadWriter(rw *handleReadWriter) {
+	// flags must be cleared here as well as set on acquire: these come from a
+	// pool, and a stale flag would label an unrelated later read.
+	rw.flags = 0
 	rw.ctx = nil
 	rw.h = noHandle
 	handleReadWriterPool.Put(rw)
@@ -144,7 +162,7 @@ func putHandleReadWriter(rw *handleReadWriter) {
 
 // Read implements io.Reader.Read.
 func (rw *handleReadWriter) Read(dst []byte) (int, error) {
-	n, err := rw.h.fdLisa.Read(rw.ctx, dst, rw.off)
+	n, err := rw.h.fdLisa.ReadWithFlags(rw.ctx, dst, rw.off, rw.flags)
 	rw.off += n
 	return int(n), err
 }
@@ -158,7 +176,7 @@ func (rw *handleReadWriter) Write(src []byte) (int, error) {
 
 // ReadToBlocks implements safemem.Reader.ReadToBlocks.
 func (rw *handleReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
-	n, err := rw.h.readToBlocksAt(rw.ctx, dsts, rw.off)
+	n, err := rw.h.readToBlocksAtWithFlags(rw.ctx, dsts, rw.off, rw.flags)
 	rw.off += n
 	return n, err
 }

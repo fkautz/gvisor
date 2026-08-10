@@ -155,6 +155,12 @@ func chunkify(chunkSize uint64, buf []byte, fn func([]byte, uint64) (uint64, err
 
 // Read makes the PRead RPC.
 func (f *ClientFD) Read(ctx context.Context, dst []byte, offset uint64) (uint64, error) {
+	return f.ReadWithFlags(ctx, dst, offset, 0)
+}
+
+// ReadWithFlags is Read, additionally telling the server why the read is
+// happening. See PReadFlag* for the meanings.
+func (f *ClientFD) ReadWithFlags(ctx context.Context, dst []byte, offset uint64, flags uint32) (uint64, error) {
 	var resp PReadResp
 	// maxDataReadSize represents the maximum amount of data we can read at once
 	// (maximum message size - metadata size present in resp). Uninitialized
@@ -166,6 +172,7 @@ func (f *ClientFD) Read(ctx context.Context, dst []byte, offset uint64) (uint64,
 			Offset: offset + curOff,
 			FD:     f.fd,
 			Count:  uint32(len(buf)),
+			Flags:  flags,
 		}
 
 		// This will be unmarshalled into. Already set Buf so that we don't need to

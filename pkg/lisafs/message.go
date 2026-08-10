@@ -878,12 +878,32 @@ type PReadReq struct {
 	Offset uint64
 	FD     FDID
 	Count  uint32
-	_      uint32 // Need to make struct packed.
+
+	// Flags is a bitmask of PReadFlag* describing WHY this read is happening.
+	//
+	// It occupies what was padding needed to keep this struct packed, so it
+	// costs no wire bytes and needs no version negotiation: a server that
+	// ignores it behaves exactly as before. Clients that have nothing to say
+	// send zero.
+	Flags uint32
 }
+
+// Flags for PReadReq.
+const (
+	// PReadFlagCopyUp means this read is part of an overlay copy-up: the
+	// contents of a lower-layer file being copied into the upper layer because
+	// something wrote to it.
+	//
+	// It is worth distinguishing because a one-byte write to a large file
+	// causes the whole file to be read, and a backend that cannot tell that
+	// apart from a foreground read cannot account for it, bound it, or refuse
+	// it. The Sentry sets it, so a sandboxed workload cannot forge it.
+	PReadFlagCopyUp uint32 = 1 << 0
+)
 
 // String implements fmt.Stringer.String.
 func (r *PReadReq) String() string {
-	return fmt.Sprintf("PReadReq{Offset: %d, FD: %d, Count: %d}", r.Offset, r.FD, r.Count)
+	return fmt.Sprintf("PReadReq{Offset: %d, FD: %d, Count: %d, Flags: %#x}", r.Offset, r.FD, r.Count, r.Flags)
 }
 
 // PReadResp is used to return the result of pread(2).

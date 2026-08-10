@@ -40,6 +40,9 @@ const (
 	opSeekHole = 4
 	opReadDir  = 5
 	opReadLink = 6
+
+	// opReadCopyUp is opRead for bytes an overlay copy-up is fetching.
+	opReadCopyUp = 7
 )
 
 // Response status codes. The distinctions are load-bearing: an absent path must
@@ -199,6 +202,13 @@ func (c *client) Stat(path string) (Attr, error) {
 // cannot express an empty successful payload, so a request that yields nothing
 // is a refusal rather than an EOF.
 func (c *client) ReadAt(path string, buf []byte, off uint64) (int, error) {
+	return c.ReadAtHinted(path, buf, off, false)
+}
+
+// ReadAtHinted is ReadAt, telling the store whether this read is an overlay
+// copy-up. The store needs it to account for the fetch separately, and to
+// decide whether to allow it at all.
+func (c *client) ReadAtHinted(path string, buf []byte, off uint64, copyUp bool) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
@@ -206,7 +216,14 @@ func (c *client) ReadAt(path string, buf []byte, off uint64) (int, error) {
 	if length > maxReadBytes {
 		length = maxReadBytes
 	}
-	request := []byte{opRead}
+	// opReadCopyUp is a distinct opcode rather than a flag byte so an older
+	// store rejects it outright instead of silently mis-accounting a copy-up
+	// as a foreground read, which is the whole thing being fixed.
+	opcode := byte(opRead)
+	if copyUp {
+		opcode = opReadCopyUp
+	}
+	request := []byte{opcode}
 	request = binary.BigEndian.AppendUint64(request, off)
 	request = binary.BigEndian.AppendUint32(request, uint32(length))
 	request, err := appendPath(request, path)

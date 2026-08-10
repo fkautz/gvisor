@@ -152,6 +152,17 @@ type OpenOptions struct {
 type ReadOptions struct {
 	// Flags contains flags as specified for preadv2(2).
 	Flags uint32
+
+	// ForCopyUp is set when this read is part of an overlay copy-up: the
+	// contents of a lower-layer file being read so they can be written to the
+	// upper layer, because something wrote to the file.
+	//
+	// IT IS A SEPARATE FIELD RATHER THAN A Flags BIT ON PURPOSE. Flags comes
+	// from preadv2(2), so a bit there could be set by the sandboxed workload
+	// itself; a filesystem that accounts for copy-up, bounds it, or refuses it
+	// must not let the workload decide which of its reads look like one. No
+	// syscall path sets this field.
+	ForCopyUp bool
 }
 
 // RenameOptions contains options to VirtualFilesystem.RenameAt() and

@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -150,6 +151,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		rw := getDentryReadWriter(ctx, d, offset)
 		// Require the read to go to the remote file.
 		rw.direct = true
+		rw.copyUp = opts.ForCopyUp
 		n, readErr = dst.CopyOutFrom(ctx, rw)
 		putDentryReadWriter(rw)
 		if d.inode.fs.opts.interop != InteropModeShared {
@@ -158,6 +160,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		}
 	} else {
 		rw := getDentryReadWriter(ctx, d, offset)
+		rw.copyUp = opts.ForCopyUp
 		n, readErr = dst.CopyOutFrom(ctx, rw)
 		putDentryReadWriter(rw)
 		if d.inode.fs.opts.interop != InteropModeShared {
@@ -330,6 +333,9 @@ type dentryReadWriter struct {
 	d      *dentry
 	off    uint64
 	direct bool
+	// copyUp records that this read is an overlay copy-up, so the remote
+	// filesystem can be told. See vfs.ReadOptions.ForCopyUp.
+	copyUp bool
 }
 
 var dentryReadWriterPool = sync.Pool{
@@ -344,13 +350,39 @@ func getDentryReadWriter(ctx context.Context, d *dentry, offset int64) *dentryRe
 	rw.d = d
 	rw.off = uint64(offset)
 	rw.direct = false
+	rw.copyUp = false
 	return rw
 }
 
 func putDentryReadWriter(rw *dentryReadWriter) {
 	rw.ctx = nil
 	rw.d = nil
+	// direct and copyUp are reset on acquire rather than here, matching the
+	// existing convention; both must stay that way, because these come from a
+	// pool and a stale flag would mislabel an unrelated later read.
 	dentryReadWriterPool.Put(rw)
+}
+
+// readFlags returns the lisafs.PReadFlag* mask describing why this read is
+// happening.
+func (rw *dentryReadWriter) readFlags() uint32 {
+	if rw.copyUp {
+		return lisafs.PReadFlagCopyUp
+	}
+	return 0
+}
+
+// readToBlocksAtFunc adapts h.readToBlocksAt for callers that take a plain
+// read function, carrying this reader's flags with it. Passing the method value
+// directly would silently drop them.
+func (rw *dentryReadWriter) readToBlocksAtFunc(h handle) func(context.Context, safemem.BlockSeq, uint64) (uint64, error) {
+	if !rw.copyUp {
+		return h.readToBlocksAt
+	}
+	flags := rw.readFlags()
+	return func(ctx context.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error) {
+		return h.readToBlocksAtWithFlags(ctx, dsts, offset, flags)
+	}
 }
 
 // ReadToBlocks implements safemem.Reader.ReadToBlocks.
@@ -368,7 +400,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	defer rw.d.inode.handleMu.RUnlock()
 	h := rw.d.inode.readHandle()
 	if (rw.d.inode.mmapFD.RacyLoad() >= 0 && !rw.d.inode.fs.opts.forcePageCache) || rw.d.inode.fs.opts.interop == InteropModeShared || rw.direct {
-		n, err := h.readToBlocksAt(rw.ctx, dsts, rw.off)
+		n, err := h.readToBlocksAtWithFlags(rw.ctx, dsts, rw.off, rw.readFlags())
 		rw.off += n
 		return n, err
 	}
@@ -435,7 +467,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					Kind:    usage.PageCache,
 					MemCgID: memCgID,
 					Mode:    pgalloc.AllocateAndWritePopulate,
-				}, h.readToBlocksAt)
+				}, rw.readToBlocksAtFunc(h))
 				mf.MarkEvictable(rw.d.inode, pgalloc.EvictableRange{Start: optMR.Start, End: optMR.End})
 				seg, gap = rw.d.inode.cache.Find(rw.off)
 				if !seg.Ok() {
@@ -448,7 +480,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 			} else {
 				// Read directly from the file.
 				gapDsts := dsts.TakeFirst64(gapMR.Length())
-				n, err := h.readToBlocksAt(rw.ctx, gapDsts, gapMR.Start)
+				n, err := h.readToBlocksAtWithFlags(rw.ctx, gapDsts, gapMR.Start, rw.readFlags())
 				done += n
 				rw.off += n
 				dsts = dsts.DropFirst64(n)

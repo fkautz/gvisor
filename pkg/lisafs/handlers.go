@@ -715,7 +715,11 @@ func PReadHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	payloadBuf := comm.PayloadBuf(respPayloadLen)
 	var n uint64
 	if err := fd.controlFD.safelyRead(func() error {
-		n, err = fd.impl.Read(payloadBuf[respMetaSize:], req.Offset)
+		if hinted, ok := fd.impl.(ReadHintedFDImpl); ok {
+			n, err = hinted.ReadHinted(payloadBuf[respMetaSize:], req.Offset, req.Flags)
+		} else {
+			n, err = fd.impl.Read(payloadBuf[respMetaSize:], req.Offset)
+		}
 		return err
 	}); err != nil {
 		return 0, err

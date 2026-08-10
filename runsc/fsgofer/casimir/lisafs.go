@@ -335,6 +335,7 @@ type openFD struct {
 }
 
 var _ lisafs.OpenFDImpl = (*openFD)(nil)
+var _ lisafs.ReadHintedFDImpl = (*openFD)(nil)
 
 func (fd *openFD) FD() *lisafs.OpenFD { return &fd.OpenFD }
 
@@ -349,7 +350,21 @@ func (fd *openFD) Stat() (lisafs.Statx, error) {
 }
 
 func (fd *openFD) Read(buf []byte, off uint64) (uint64, error) {
-	n, err := fd.conn.client.ReadAt(fd.path, buf, off)
+	return fd.ReadHinted(buf, off, 0)
+}
+
+// ReadHinted implements lisafs.ReadHintedFDImpl.ReadHinted.
+//
+// THE HINT IS WHY THIS BACKEND IMPLEMENTS THE OPTIONAL INTERFACE. An overlay
+// copy-up reads a whole file because the workload wrote one byte to it, and
+// those bytes are fetched and verified here exactly like a foreground read.
+// Without the hint the store cannot tell them apart, so it can neither account
+// for the copy-up nor bound it -- a one-byte write to a large file is an
+// unbounded synchronous fetch that looks, from here, like ordinary reading.
+//
+// A zero mask means the client said nothing, not that the read is foreground.
+func (fd *openFD) ReadHinted(buf []byte, off uint64, flags uint32) (uint64, error) {
+	n, err := fd.conn.client.ReadAtHinted(fd.path, buf, off, flags&lisafs.PReadFlagCopyUp != 0)
 	if err != nil {
 		return 0, err
 	}

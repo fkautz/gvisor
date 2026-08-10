@@ -1048,7 +1048,10 @@ func CopyRegularFileData(ctx context.Context, dstFD, srcFD *FileDescription) (in
 	done := int64(0)
 	buf := usermem.BytesIOSequence(make([]byte, 32*1024)) // arbitrary buffer size
 	for {
-		readN, readErr := srcFD.Read(ctx, buf, ReadOptions{})
+		// ForCopyUp: this loop is the only reader of srcFD, which was opened
+		// solely for this copy, so every byte it moves is copy-up traffic. A
+		// filesystem that has to fetch those bytes has no other way to know.
+		readN, readErr := srcFD.Read(ctx, buf, ReadOptions{ForCopyUp: true})
 		if readErr != nil && readErr != io.EOF {
 			return done, readErr
 		}

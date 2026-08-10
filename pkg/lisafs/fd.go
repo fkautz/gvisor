@@ -218,6 +218,31 @@ func (fd *ControlFD) forEachOpenFD(fn func(ofd *OpenFD)) {
 	}
 }
 
+// ReadHintedFDImpl is optionally implemented by an OpenFDImpl that wants to
+// know why a read is happening.
+//
+// IT IS OPTIONAL ON PURPOSE. Most backends read a host file and have no use for
+// the distinction, and making it part of OpenFDImpl would break every
+// implementation to serve the few that care. A backend that fetches bytes over
+// a network, verifies them, or bills for them is the case this exists for: an
+// overlay copy-up reads a whole file because something wrote one byte to it,
+// and without a hint that is indistinguishable from the workload reading the
+// file itself.
+//
+// When implemented, the server calls ReadHinted and never Read. Read must still
+// be implemented, because OpenFDImpl requires it.
+type ReadHintedFDImpl interface {
+	OpenFDImpl
+
+	// ReadHinted is Read, with a bitmask of PReadFlag* describing the reason
+	// for the read. Flags are advisory: a zero mask means the client said
+	// nothing, not that the read is a foreground one, so an implementation
+	// must remain correct when it never sees a flag set.
+	//
+	// It carries the same read concurrency guarantee as Read.
+	ReadHinted(buf []byte, off uint64, flags uint32) (uint64, error)
+}
+
 // OpenFD represents an open file descriptor on the protocol. It resonates
 // closely with a Linux file descriptor. Its operations are limited to the
 // file. Its operations are not allowed to modify or traverse the filesystem
@@ -603,6 +628,9 @@ type OpenFDImpl interface {
 
 	// Read reads at offset off into buf from the backing file via this open FD.
 	// Read attempts to read len(buf) bytes and returns the number of bytes read.
+	//
+	// An implementation that wants to know WHY a read is happening implements
+	// ReadHintedFDImpl instead; this method is what it falls back to.
 	//
 	// On the server, Read has a read concurrency guarantee. See Open for
 	// additional requirements regarding lazy path resolution.
