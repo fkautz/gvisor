@@ -162,9 +162,25 @@ func (fd *controlFD) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, error) 
 	if err != nil {
 		return nil, lisafs.Statx{}, err
 	}
+	// EVERY WALKED CHILD NEEDS ITS OWN Node. A Node is the server-side identity
+	// of a file and the client caches against it, so initializing a child FD
+	// with its PARENT's Node makes every sibling the same file: walk two names
+	// in one directory and the second resolves to the first one's contents,
+	// size and all. Only a fixture with two files in one directory can catch
+	// that -- a one-file rootfs always agrees with itself.
+	parentNode := fd.Node()
+	var childNode *lisafs.Node
+	parentNode.WithChildrenMu(func() {
+		if childNode = parentNode.LookupChildLocked(name); childNode == nil {
+			childNode = &lisafs.Node{}
+			// InitLocked transfers a ref to us; the else branch takes its own.
+			childNode.InitLocked(name, parentNode)
+		} else {
+			childNode.IncRef()
+		}
+	})
 	walked := &controlFD{conn: fd.conn, path: child}
-	fd.Node().IncRef()
-	walked.ControlFD.Init(fd.Conn(), fd.Node(), linux.FileMode(attr.Mode), walked)
+	walked.ControlFD.Init(fd.Conn(), childNode, linux.FileMode(attr.Mode), walked)
 	return walked.FD(), statxFromAttr(attr), nil
 }
 
