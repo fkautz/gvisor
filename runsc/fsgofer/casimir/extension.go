@@ -27,10 +27,17 @@ import (
 	"gvisor.dev/gvisor/runsc/fsgofer/extension"
 )
 
-// SocketAnnotation names the store's stream socket in the OCI spec. Its
-// presence is what makes this extension claim the root; absence leaves every
-// mount to the stock fsgofer.
-const SocketAnnotation = "dev.casimir.store-socket"
+// SocketAnnotation names Casimir's bridge socket in the OCI spec. Its presence
+// is what makes this extension claim the root; absence leaves every mount to
+// the stock fsgofer.
+//
+// THE LITERAL MUST MATCH bridgeSocketAnnotation IN CASIMIR's ADAPTER. The two
+// sides are compile-time independent -- nothing links them -- so a mismatch
+// produces no build error and no runtime error: the extension simply never
+// claims the root and the stock fsgofer serves it from host files instead. That
+// is a silent fallback to the eager behaviour this backend exists to remove,
+// and only an end-to-end test can catch it.
+const SocketAnnotation = "dev.casimir.bridge-socket"
 
 func init() {
 	extension.Register(&Extension{})
