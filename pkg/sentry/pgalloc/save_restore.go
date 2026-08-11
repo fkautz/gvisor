@@ -107,6 +107,26 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// SharedBaseFile and SharedBaseBytes are the shared base that this
+	// checkpoint is saved against, covering file offsets [0,
+	// SharedBaseBytes). Committed pages whose contents the base already
+	// carries are recorded in memoryFileSaved.baseBacked and omitted from the
+	// checkpoint, so that LoadFrom() can leave them to the base rather than
+	// copy-on-writing a private page per sandbox.
+	//
+	// If SharedBaseFile is nil, MemoryFileOpts.SharedBaseFile is used instead.
+	// That default matters: saving a MemoryFile that is running on a shared
+	// base without mentioning the base produces a checkpoint that reloads the
+	// whole base range, which restores byte-correct and shares nothing. The
+	// only way to observe that mistake is to measure sharing, so it defaults
+	// to the answer that is right whenever a base is present.
+	//
+	// Passing a base explicitly is for the case the default cannot serve: a
+	// checkpoint saved against a base image that is minted from this very
+	// MemoryFile, and so does not exist until the save is under way.
+	SharedBaseFile  *os.File
+	SharedBaseBytes uint64
 }
 
 // SaveTo writes f's state to the given stream.
@@ -186,6 +206,76 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		}
 	}
 
+	// Resolve the shared base this checkpoint is saved against, and find the
+	// ranges of it that carry data. A hole in the base is not a page of zeros:
+	// it is a range the base does not carry, whose real contents are installed
+	// on first touch. Comparing a guest page against a hole reads zeros and so
+	// compares equal, but recording that page as base-carried would hand the
+	// restored guest whatever is installed there later. Only a range the base
+	// actually carries can be left to the base.
+	baseFile, baseBytes := opts.SharedBaseFile, opts.SharedBaseBytes
+	if baseFile == nil {
+		baseFile, baseBytes = f.opts.SharedBaseFile, f.opts.SharedBaseBytes
+	}
+	var (
+		baseData dataExtents
+		baseBuf  []byte
+		// baseOverlayEnd is the end of the range the base actually backs, which
+		// is baseBytes rounded up to a page because that is what mmap covers.
+		baseOverlayEnd uint64
+		baseBacked     []memmap.FileRange
+	)
+	if baseFile == nil || baseBytes == 0 {
+		baseFile, baseBytes = nil, 0
+	} else {
+		fi, err := baseFile.Stat()
+		if err != nil {
+			return fmt.Errorf("failed to stat shared base file: %w", err)
+		}
+		if size := fi.Size(); size < 0 || baseBytes > uint64(size) {
+			return fmt.Errorf("shared base range (%d bytes) exceeds the shared base file (%d bytes)", baseBytes, size)
+		}
+		ranges, err := fileDataRanges(baseFile, baseBytes)
+		if err != nil {
+			return fmt.Errorf("failed to find the data ranges of the shared base file: %w", err)
+		}
+		baseData = dataExtents{ranges: ranges}
+		baseBuf = make([]byte, hostarch.PageSize)
+		baseOverlayEnd = (baseBytes + hostarch.PageSize - 1) &^ uint64(hostarch.PageSize-1)
+	}
+	// recordBaseBacked accumulates the ranges the base carries. The scan visits
+	// offsets in ascending order, so appending keeps baseBacked sorted, and
+	// coalescing keeps a run that a segment boundary split from being recorded
+	// as two ranges.
+	recordBaseBacked := func(fr memmap.FileRange) {
+		if n := len(baseBacked); n != 0 && baseBacked[n-1].End == fr.Start {
+			baseBacked[n-1].End = fr.End
+			return
+		}
+		baseBacked = append(baseBacked, fr)
+	}
+	// pageIsBaseBacked reports whether the base carries exactly the contents of
+	// the page at off. A failure to read the base aborts the save through
+	// baseReadErr. The page itself would be safe either way, since a page not
+	// recognized as base-carried is written out; but a save that quietly
+	// stopped recognizing them would produce a checkpoint that restores
+	// correctly and shares nothing, and nothing downstream can see that.
+	//
+	// Preconditions: Successive calls must pass ascending offsets.
+	var baseReadErr error
+	pageIsBaseBacked := func(off uint64, pg []byte) bool {
+		if !baseData.carries(memmap.FileRange{off, off + hostarch.PageSize}) {
+			return false
+		}
+		if _, err := baseFile.ReadAt(baseBuf, int64(off)); err != nil {
+			if baseReadErr == nil {
+				baseReadErr = fmt.Errorf("failed to read the shared base file at offset %d: %w", off, err)
+			}
+			return false
+		}
+		return bytes.Equal(pg, baseBuf)
+	}
+
 	// Reading an uncommitted page to determine if it is zero-filled will cause
 	// it to become committed. Thus, we need to decommit zero-filled pages that
 	// were not previously known to be committed to avoid increasing memory
@@ -241,8 +331,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		updatePendingFR           memmap.FileRange
 		updatePendingWasCommitted bool
 		updatePendingNowCommitted bool
+		updatePendingNowBase      bool
 	)
-	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
+	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
 		amount := fr.Length()
 		if amount == 0 {
 			return maseg
@@ -268,19 +359,25 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			maseg = f.memAcct.Unisolate(maseg)
 		}
 		if nowCommitted {
-			asyncWritePages(fr)
+			// A range the base carries stays committed -- it is present, not
+			// absent -- but the checkpoint records it rather than storing it.
+			if nowBase {
+				recordBaseBacked(fr)
+			} else {
+				asyncWritePages(fr)
+			}
 		}
 		return maseg
 	}
 	// Precondition: maseg.Range().IsSupersetOf(fr).
 	// Postcondition: The returned memAcctIterator.Range().IsSupersetOf(fr).
-	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
-		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted {
+	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
+		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted && updatePendingNowBase == nowBase {
 			updatePendingFR.End = fr.End
 			return maseg
 		}
 		if updatePendingFR.Length() != 0 {
-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
+			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
 			if maseg.End() == fr.Start {
 				maseg = maseg.NextSegment()
 			}
@@ -288,11 +385,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		updatePendingFR = fr
 		updatePendingWasCommitted = wasCommitted
 		updatePendingNowCommitted = nowCommitted
+		updatePendingNowBase = nowBase
 		return maseg
 	}
 	updateFlush := func(maseg memAcctIterator) memAcctIterator {
 		if updatePendingFR.Length() != 0 {
-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
+			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
 		}
 		updatePendingFR = memmap.FileRange{}
 		return maseg
@@ -329,9 +427,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		allocatedBytes += fr.Length()
 		ma.commitSeq = 0
 		wasCommitted := ma.knownCommitted
-		if !opts.ExcludeCommittedZeroPages && wasCommitted {
+		// A segment inside the base range must be scanned even when zero-page
+		// exclusion is off, because that is the only way to learn which of its
+		// pages the base already carries.
+		if !opts.ExcludeCommittedZeroPages && wasCommitted && fr.Start >= baseOverlayEnd {
 			alreadyCommittedBytes += fr.Length()
-			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */)
+			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */, false /* nowBase */)
 			maseg = updateFlush(maseg)
 			if maseg.End() == unscannedStart {
 				maseg = maseg.NextSegment()
@@ -344,7 +445,26 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 				pg := bs[pgoff : pgoff+hostarch.PageSize]
 				off := chunkFR.Start + uint64(pgoff)
 				isZeroed := bytes.Equal(pg, zeroPage)
-				if isZeroed {
+				// Leaving a page out of the checkpoint means "not committed",
+				// and a page that is not committed reads as zero -- from the
+				// MemoryFile's own file. Inside the base range it reads what
+				// the base carries instead, so a zeroed page can only be left
+				// out when the base carries exactly those bytes, which is the
+				// same condition as being base-backed. Every other page in the
+				// base range has to be written, zeroed or not.
+				nowBase := false
+				nowCommitted := !isZeroed
+				if off < baseOverlayEnd {
+					// A page is eligible to be left to the base only if the
+					// base range contains all of it, but the overlay covers the
+					// page containing the end of a base range that is not
+					// page-aligned, since mmap rounds its length up. That last
+					// page reads from the base too, so it also cannot be left
+					// out of the checkpoint.
+					nowBase = off+hostarch.PageSize <= baseBytes && pageIsBaseBacked(off, pg)
+					nowCommitted = true
+				}
+				if !nowCommitted {
 					if !wasCommitted {
 						alreadyUncommittedBytes += hostarch.PageSize
 						decommitAddPage(off)
@@ -358,7 +478,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 						alreadyCommittedBytes += hostarch.PageSize
 					}
 				}
-				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
+				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, nowCommitted, nowBase)
 			}
 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
 			// occasionally unlock f.mu to ensure that the former can promptly
@@ -382,6 +502,13 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	if decommitPendingFR.Length() != 0 {
 		decommitNow(decommitPendingFR)
 		decommitPendingFR = memmap.FileRange{}
+	}
+	if baseReadErr != nil {
+		// Fail the whole save rather than emit a checkpoint that shares less of
+		// the base than it should. With async page saving some pages have
+		// already been queued, but no metadata has been written, so there is no
+		// checkpoint to mistake for a complete one.
+		return baseReadErr
 	}
 
 	durScan := time.Duration(gohacks.Nanotime() - timeScanStart)
@@ -408,35 +535,41 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		subreleased:  f.subreleased,
 		memAcct:      &f.memAcct,
 		chunks:       f.chunksLoad(),
+		baseBacked:   baseBacked,
 	}); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
 	if amfs == nil {
-		// Save committed pages.
+		// Save committed pages, skipping the ranges the base carries. LoadFrom
+		// walks the same segments in the same order and skips the same ranges;
+		// page contents are positional, so the two walks agreeing is what makes
+		// the stream readable at all.
 		ww := wire.Writer{Writer: w}
 		timePagesStart := gohacks.Nanotime()
 		bytesSaved := uint64(0)
+		notBaseBacked := baseBackedWalker{ranges: baseBacked}
 		for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
 			if !maseg.ValuePtr().knownCommitted {
 				continue
 			}
-			maFR := maseg.Range()
-			// Write a header to distinguish from objects.
-			if err := state.WriteHeader(&ww, maFR.Length(), false); err != nil {
-				return err
-			}
-			// Write out data.
-			var ioErr error
-			f.forEachMappingSlice(maFR, func(s []byte) {
-				if ioErr != nil {
-					return
+			if err := notBaseBacked.forEach(maseg.Range(), func(fr memmap.FileRange) error {
+				// Write a header to distinguish from objects.
+				if err := state.WriteHeader(&ww, fr.Length(), false); err != nil {
+					return err
 				}
-				_, ioErr = w.Write(s)
-			})
-			if ioErr != nil {
+				// Write out data.
+				var ioErr error
+				f.forEachMappingSlice(fr, func(s []byte) {
+					if ioErr != nil {
+						return
+					}
+					_, ioErr = w.Write(s)
+				})
 				return ioErr
+			}); err != nil {
+				return err
 			}
 		}
 		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
@@ -968,6 +1101,37 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	if _, err := state.Load(ctx, r, &mfs); err != nil {
 		return fmt.Errorf("failed to load metadata: %w", err)
 	}
+	// A checkpoint that carries base-backed ranges is only meaningful against
+	// the base that produced it. Restoring it without one would leave those
+	// ranges unwritten and unbacked, so the guest would read a zero-filled page
+	// where committed memory belongs -- the absent-versus-known-zero confusion
+	// this list exists to prevent. Refuse before any of the checkpoint is
+	// adopted into f, so that a refused restore leaves f as it found it.
+	if len(mfs.baseBacked) != 0 {
+		if opts.SharedBaseFile == nil {
+			return fmt.Errorf(
+				"checkpoint carries %d base-backed range(s) but no shared base file was supplied",
+				len(mfs.baseBacked))
+		}
+		prevEnd := uint64(0)
+		for _, fr := range mfs.baseBacked {
+			// The walk below relies on these being ordered and disjoint, and a
+			// walk that silently reads the wrong offsets restores the wrong
+			// bytes without failing anywhere.
+			if !fr.WellFormed() || fr.Length() == 0 || fr.Start < prevEnd {
+				return fmt.Errorf(
+					"checkpoint base-backed ranges are not ascending and disjoint: %v follows offset %d",
+					fr, prevEnd)
+			}
+			prevEnd = fr.End
+			if fr.End > opts.SharedBaseBytes {
+				return fmt.Errorf(
+					"checkpoint base-backed range [%d, %d) is not provided by the supplied base (%d bytes)",
+					fr.Start, fr.End, opts.SharedBaseBytes)
+			}
+		}
+	}
+
 	f.unwasteSmall.MoveFrom(mfs.unwasteSmall)
 	f.unwasteHuge.MoveFrom(mfs.unwasteHuge)
 	f.unfreeSmall.MoveFrom(mfs.unfreeSmall)
@@ -976,26 +1140,6 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	f.memAcct.MoveFrom(mfs.memAcct)
 	chunks := mfs.chunks
 	f.chunks.Store(&chunks)
-
-	// A checkpoint that carries base-backed ranges is only meaningful against
-	// the base that produced it. Restoring it without one would leave those
-	// ranges unwritten and unbacked, so the guest would read a zero-filled page
-	// where committed memory belongs -- the absent-versus-known-zero confusion
-	// this list exists to prevent. Refuse before any page is loaded.
-	if len(mfs.baseBacked) != 0 {
-		if opts.SharedBaseFile == nil {
-			return fmt.Errorf(
-				"checkpoint carries %d base-backed range(s) but no shared base file was supplied",
-				len(mfs.baseBacked))
-		}
-		for _, fr := range mfs.baseBacked {
-			if fr.End > opts.SharedBaseBytes {
-				return fmt.Errorf(
-					"checkpoint base-backed range [%d, %d) is not provided by the supplied base (%d bytes)",
-					fr.Start, fr.End, opts.SharedBaseBytes)
-			}
-		}
-	}
 	mfTimeline.Reached("metadata loaded")
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
@@ -1121,6 +1265,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	wr := wire.Reader{Reader: r}
 	timePagesStart := gohacks.Nanotime()
 	minUnloadedInit := false
+	notBaseBacked := baseBackedWalker{ranges: mfs.baseBacked}
 	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
 		if !maseg.ValuePtr().knownCommitted {
 			continue
@@ -1131,43 +1276,57 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		for madviseEnd.Load() < maFR.End {
 			<-madviseChan
 		}
+		// Skip the ranges the shared base carries: they are already correct in
+		// the base, and writing them would copy-on-write a page private to this
+		// sandbox and share nothing, which is the entire failure this exists to
+		// prevent. SaveTo left them out of the stream in this same walk order.
 		if amfl != nil {
 			// Record where to read data.
-			if !minUnloadedInit {
-				minUnloadedInit = true
-				amfl.minUnloaded.Store(maFR.Start)
-			}
-			amfl.pf.mu.Lock()
-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: opts.PagesFileOffset,
-			})
-			amfl.pf.mu.Unlock()
-			opts.PagesFileOffset += amount
-			amfl.pf.lfStatus.Notify(aplLFPending)
-		} else {
-			// Verify header.
-			length, object, err := state.ReadHeader(&wr)
-			if err != nil {
-				return fmt.Errorf("failed to read header: %w", err)
-			}
-			if object {
-				// Not expected.
-				return fmt.Errorf("unexpected object")
-			}
-			if length != amount {
-				// Size mismatch.
-				return fmt.Errorf("mismatched segment: expected %d, got %d", amount, length)
-			}
-			// Read data.
-			var ioErr error
-			f.forEachMappingSlice(maFR, func(s []byte) {
-				if ioErr != nil {
-					return
+			if err := notBaseBacked.forEach(maFR, func(fr memmap.FileRange) error {
+				if !minUnloadedInit {
+					minUnloadedInit = true
+					amfl.minUnloaded.Store(fr.Start)
 				}
-				_, ioErr = io.ReadFull(r, s)
-			})
-			if ioErr != nil {
-				return fmt.Errorf("failed to read pages: %w", ioErr)
+				amfl.pf.mu.Lock()
+				amfl.unloaded.InsertRange(fr, aplUnloadedInfo{
+					off: opts.PagesFileOffset,
+				})
+				amfl.pf.mu.Unlock()
+				opts.PagesFileOffset += fr.Length()
+				amfl.pf.lfStatus.Notify(aplLFPending)
+				return nil
+			}); err != nil {
+				return err
+			}
+		} else {
+			if err := notBaseBacked.forEach(maFR, func(fr memmap.FileRange) error {
+				// Verify header.
+				length, object, err := state.ReadHeader(&wr)
+				if err != nil {
+					return fmt.Errorf("failed to read header: %w", err)
+				}
+				if object {
+					// Not expected.
+					return fmt.Errorf("unexpected object")
+				}
+				if length != fr.Length() {
+					// Size mismatch.
+					return fmt.Errorf("mismatched segment: expected %d, got %d", fr.Length(), length)
+				}
+				// Read data.
+				var ioErr error
+				f.forEachMappingSlice(fr, func(s []byte) {
+					if ioErr != nil {
+						return
+					}
+					_, ioErr = io.ReadFull(r, s)
+				})
+				if ioErr != nil {
+					return fmt.Errorf("failed to read pages: %w", ioErr)
+				}
+				return nil
+			}); err != nil {
+				return err
 			}
 		}
 
@@ -2052,6 +2211,104 @@ func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, sp
 		waiters: ul.waiters[:len(ul.waiters):len(ul.waiters)],
 	}
 	return ul, ul2
+}
+
+// fileDataRanges returns the ranges of file within [0, limit) that the file
+// carries data for, in ascending order. The remainder is holes.
+//
+// This distinction is not an optimization. A hole reads as zeros, so a page
+// compared against one compares equal to a page of zeros while the file carries
+// nothing there at all; whatever is written into the hole afterwards is what a
+// reader sees. Only a range that is data now can be left to the file later.
+//
+// Note that this moves file's offset, since SEEK_DATA and SEEK_HOLE are how the
+// question is asked.
+func fileDataRanges(file *os.File, limit uint64) ([]memmap.FileRange, error) {
+	fd := int(file.Fd())
+	var ranges []memmap.FileRange
+	for off := uint64(0); off < limit; {
+		dataStart, err := unix.Seek(fd, int64(off), unix.SEEK_DATA)
+		if err == unix.ENXIO {
+			// No data at or after off.
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("SEEK_DATA from offset %d: %w", off, err)
+		}
+		if uint64(dataStart) >= limit {
+			break
+		}
+		holeStart, err := unix.Seek(fd, dataStart, unix.SEEK_HOLE)
+		if err != nil {
+			return nil, fmt.Errorf("SEEK_HOLE from offset %d: %w", dataStart, err)
+		}
+		if holeStart <= dataStart {
+			return nil, fmt.Errorf("SEEK_HOLE from offset %d returned %d, which is not after it", dataStart, holeStart)
+		}
+		end := uint64(holeStart)
+		if end > limit {
+			end = limit
+		}
+		ranges = append(ranges, memmap.FileRange{uint64(dataStart), end})
+		off = uint64(holeStart)
+	}
+	return ranges, nil
+}
+
+// dataExtents answers whether a file carries data for a range, for ascending
+// ranges. It holds a cursor rather than searching, since both users walk the
+// MemoryFile in order and the extent list can be as long as the file is
+// fragmented.
+type dataExtents struct {
+	ranges []memmap.FileRange
+	i      int
+}
+
+// carries reports whether the file carries data for all of fr.
+//
+// Preconditions: Successive calls must pass ascending, non-overlapping ranges.
+func (d *dataExtents) carries(fr memmap.FileRange) bool {
+	for d.i < len(d.ranges) && d.ranges[d.i].End <= fr.Start {
+		d.i++
+	}
+	return d.i < len(d.ranges) && d.ranges[d.i].IsSupersetOf(fr)
+}
+
+// baseBackedWalker yields the parts of a range that the shared base does not
+// carry, and which a checkpoint therefore has to store itself. SaveTo and
+// LoadFrom both walk their committed segments through one of these, which is
+// what makes the two agree on the layout of a page stream that carries no
+// offsets of its own.
+type baseBackedWalker struct {
+	ranges []memmap.FileRange
+	i      int
+}
+
+// forEach calls fn on each maximal sub-range of fr that is not in w.ranges, in
+// ascending order, stopping at the first error.
+//
+// Preconditions: w.ranges is ascending and disjoint. Successive calls must pass
+// ascending, non-overlapping ranges.
+func (w *baseBackedWalker) forEach(fr memmap.FileRange, fn func(memmap.FileRange) error) error {
+	for w.i < len(w.ranges) && w.ranges[w.i].End <= fr.Start {
+		w.i++
+	}
+	start := fr.Start
+	for j := w.i; j < len(w.ranges) && w.ranges[j].Start < fr.End && start < fr.End; j++ {
+		bb := w.ranges[j]
+		if bb.Start > start {
+			if err := fn(memmap.FileRange{start, bb.Start}); err != nil {
+				return err
+			}
+		}
+		if bb.End > start {
+			start = bb.End
+		}
+	}
+	if start < fr.End {
+		return fn(memmap.FileRange{start, fr.End})
+	}
+	return nil
 }
 
 func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.ClientFileRangeSetting {

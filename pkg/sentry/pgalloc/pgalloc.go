@@ -589,6 +589,17 @@ func (f *MemoryFile) releaserDestroyLocked() {
 	chunks := f.chunksLoad()
 	for i := range chunks {
 		chunk := &chunks[i]
+		if chunk.mapping == 0 {
+			// A chunk can be known without being mapped: LoadFrom() adopts the
+			// checkpoint's chunks, and chunkInfo.mapping is not saved, so a
+			// restore that fails between adopting them and mapping them leaves
+			// chunks here with no mapping. Unmapping one would pass address 0
+			// to munmap, which is page-aligned and therefore accepted, and
+			// would unmap the first chunkSize bytes of this process's own
+			// address space -- taking the program text with it, which is why
+			// the resulting crash says nothing at all.
+			continue
+		}
 		_, _, errno := unix.Syscall(unix.SYS_MUNMAP, chunk.mapping, chunkSize, 0)
 		if errno != 0 {
 			log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)

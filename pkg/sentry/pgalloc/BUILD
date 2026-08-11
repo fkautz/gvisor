@@ -207,10 +207,14 @@ go_test(
     srcs = [
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
+        "save_restore_shared_base_test.go",
     ],
     library = ":pgalloc",
     deps = [
+        "//pkg/context",
         "//pkg/hostarch",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/state/stateio",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
