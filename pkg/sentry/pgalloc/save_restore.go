@@ -75,6 +75,19 @@ type memoryFileSaved struct {
 	subreleased  map[uint64]uint64
 	memAcct      *memAcctSet
 	chunks       []chunkInfo
+
+	// baseBacked are committed ranges whose contents are carried by the shared
+	// base file rather than by this checkpoint's pages file. Restore MUST NOT
+	// write them: they are already correct in the base, and writing them would
+	// copy-on-write a private page per sandbox and defeat sharing entirely.
+	//
+	// This is deliberately a distinct list rather than an absence from the
+	// pages file. A range simply missing from the checkpoint means "not
+	// committed", and conflating that with "carried by the base" would let a
+	// base range the supplied file does not actually provide resolve to a
+	// zero-filled page. Absent and base-carried must stay distinguishable so
+	// the shortfall can fail closed instead.
+	baseBacked []memmap.FileRange
 }
 
 // SaveOpts provides options to MemoryFile.SaveTo().
@@ -963,6 +976,26 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	f.memAcct.MoveFrom(mfs.memAcct)
 	chunks := mfs.chunks
 	f.chunks.Store(&chunks)
+
+	// A checkpoint that carries base-backed ranges is only meaningful against
+	// the base that produced it. Restoring it without one would leave those
+	// ranges unwritten and unbacked, so the guest would read a zero-filled page
+	// where committed memory belongs -- the absent-versus-known-zero confusion
+	// this list exists to prevent. Refuse before any page is loaded.
+	if len(mfs.baseBacked) != 0 {
+		if opts.SharedBaseFile == nil {
+			return fmt.Errorf(
+				"checkpoint carries %d base-backed range(s) but no shared base file was supplied",
+				len(mfs.baseBacked))
+		}
+		for _, fr := range mfs.baseBacked {
+			if fr.End > opts.SharedBaseBytes {
+				return fmt.Errorf(
+					"checkpoint base-backed range [%d, %d) is not provided by the supplied base (%d bytes)",
+					fr.Start, fr.End, opts.SharedBaseBytes)
+			}
+		}
+	}
 	mfTimeline.Reached("metadata loaded")
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
