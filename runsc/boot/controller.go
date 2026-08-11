@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strconv"
 	"sync"
@@ -558,11 +559,15 @@ type RestoreOpts struct {
 	// 1. checkpoint state file.
 	// 2. optional checkpoint pages metadata file.
 	// 3. optional checkpoint pages file.
-	// 4. optional platform device file.
+	// 4. optional shared base file.
+	// 5. optional platform device file.
 	urpc.FilePayload
-	HavePagesFile  bool
-	HaveDeviceFile bool
-	Background     bool
+	HavePagesFile bool
+	// HaveSharedBaseFile is true if the payload carries the shared base image
+	// this checkpoint was taken against; see checkpointfiles.SharedBaseFileName.
+	HaveSharedBaseFile bool
+	HaveDeviceFile     bool
+	Background         bool
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
@@ -624,8 +629,24 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 		timer:      timer,
 	}
 
+	// The shared base, if this checkpoint was taken against one. It has to be
+	// in hand before the main MemoryFile is created, because the base is what
+	// backs that MemoryFile's base range; the checkpoint then carries only the
+	// pages that differ from it.
+	var sharedBaseFile *os.File
+	if o.HaveSharedBaseFile {
+		fd, err := o.ReleaseFD(sharedBaseFDIndex(o))
+		if err != nil {
+			return fmt.Errorf("releasing shared base file: %w", err)
+		}
+		// Ownership passes to the MemoryFile, which keeps the file open for the
+		// lifetime of the sandbox: it re-maps the base over every chunk it
+		// extends, and reads it again if this sandbox is itself checkpointed.
+		sharedBaseFile = fd.ReleaseToFile("shared base file")
+	}
+
 	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP, sharedBaseFile)
 	if err != nil {
 		return fmt.Errorf("creating memory file: %v", err)
 	}
@@ -693,6 +714,18 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 	timer.Reached("restorer initialized")
 	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+}
+
+// sharedBaseFDIndex returns the index of the shared base file in o's payload.
+// It follows the state file and the pages files, and precedes the device file,
+// which is located from the end of the payload.
+//
+// Preconditions: o.HaveSharedBaseFile is true.
+func sharedBaseFDIndex(o *RestoreOpts) int {
+	if o.HavePagesFile {
+		return 3
+	}
+	return 1
 }
 
 func getRestoreReaders(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {

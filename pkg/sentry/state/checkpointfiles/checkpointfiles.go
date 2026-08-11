@@ -25,6 +25,17 @@ const (
 	// PagesFileName is the file in an image-path directory containing
 	// MemoryFile page contents.
 	PagesFileName = "pages.img"
+
+	// SharedBaseFileName is the optional file in an image-path directory
+	// containing the shared base image the checkpoint was taken against, in
+	// main-MemoryFile-offset layout. When it is present, the base range of the
+	// restored sandbox's memory is backed by a MAP_PRIVATE mapping of this
+	// file -- shared with every other sandbox restored from it -- and the
+	// checkpoint carries only the pages that differ from it.
+	//
+	// The file is mapped by the sentry and shared across sandboxes, so it must
+	// be read-only and must not change while any of them is running.
+	SharedBaseFileName = "base.img"
 )
 
 // Files specific to full checkpoints:

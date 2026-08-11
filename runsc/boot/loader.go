@@ -672,7 +672,9 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create memory file.
-	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
+	// A sandbox that boots from scratch has no checkpoint and so no shared
+	// base; the base arrives with the checkpoint, in containerManager.Restore.
+	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1016,7 +1018,14 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 	})
 }
 
-func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
+// createMemoryFile creates the sandbox's main MemoryFile.
+//
+// If sharedBase is not nil, it is the shared base image that backs the low part
+// of the MemoryFile: that range is mapped MAP_PRIVATE from it, so the pages are
+// physically shared with every other sandbox mapping the same file and a write
+// takes a private copy. createMemoryFile takes ownership of sharedBase, which
+// must stay open for the lifetime of the MemoryFile.
+func createMemoryFile(appHugePages bool, hostTHP HostTHP, sharedBase *os.File) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
 	memfd, err := memutil.CreateMemFD(memfileName, 0)
 	if err != nil {
@@ -1028,6 +1037,23 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
+	}
+	if sharedBase != nil {
+		// The base covers the whole file it is given as, in MemoryFile-offset
+		// layout starting at offset 0. Taking the size from the file rather
+		// than from a separate argument means there is no second number that
+		// can disagree with it.
+		fi, err := sharedBase.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("error statting shared base file: %w", err)
+		}
+		size := fi.Size()
+		if size < 0 {
+			return nil, fmt.Errorf("shared base file has negative size %d", size)
+		}
+		mfopts.SharedBaseFile = sharedBase
+		mfopts.SharedBaseBytes = uint64(size)
+		log.Infof("Backing the first %d bytes of the main MemoryFile with the shared base file", size)
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {

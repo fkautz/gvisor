@@ -83,10 +83,16 @@ type SaveOpts struct {
 	// metadata file is provided.
 	HavePagesFile bool `json:"have_pages_file"`
 
+	// HaveSharedBaseFile indicates whether an empty file is provided for the
+	// application memory file to be exported into and saved against; see
+	// state.SaveOpts.SharedBase.
+	HaveSharedBaseFile bool `json:"have_shared_base_file"`
+
 	// FilePayload contains the following:
 	// 1. checkpoint state file.
 	// 2. optional checkpoint pages metadata file.
 	// 3. optional checkpoint pages file.
+	// 4. optional shared base file.
 	urpc.FilePayload
 
 	// Resume indicates if the sandbox process should continue running
@@ -154,6 +160,9 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 	if o.HavePagesFile {
 		wantFiles += 2
 	}
+	if o.HaveSharedBaseFile {
+		wantFiles++
+	}
 	if gotFiles := len(o.FilePayload.Files); gotFiles != wantFiles {
 		return fmt.Errorf("got %d files, wanted %d", gotFiles, wantFiles)
 	}
@@ -182,6 +191,14 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 			return err
 		}
 		saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(pagesFileFD))
+	}
+	if o.HaveSharedBaseFile {
+		// The shared base file is last in the payload.
+		sharedBaseFile, err := o.ReleaseFD(wantFiles - 1)
+		if err != nil {
+			return err
+		}
+		saveOpts.SharedBase = sharedBaseFile.ReleaseToFile("shared base file")
 	}
 	return nil
 }

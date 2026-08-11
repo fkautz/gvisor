@@ -638,6 +638,20 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 	} else {
 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
+
+	// The shared base image is optional: a checkpoint taken against one
+	// restores onto it, physically sharing its resident pages with every other
+	// sandbox restored from the same file. A checkpoint that was taken against
+	// a base and is restored without one is refused rather than restored from
+	// zeroes; see pgalloc.MemoryFile.LoadFrom.
+	sharedBaseFileName := path.Join(imagePath, checkpointfiles.SharedBaseFileName)
+	if bf, err := os.Open(sharedBaseFileName); err == nil {
+		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
+		opt.HaveSharedBaseFile = true
+		log.Infof("Restoring sandbox %q onto shared base file %q", s.ID, sharedBaseFileName)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("opening shared base file %q failed: %w", sharedBaseFileName, err)
+	}
 	return nil
 }
 
@@ -1632,8 +1646,12 @@ type CheckpointOpts struct {
 	Resume                    bool
 	Direct                    bool
 	ExcludeCommittedZeroPages bool
-	CudaCheckpointPath        string
-	CudaCheckpointSequential  bool
+	// ExportSharedBase writes the sandbox's memory to base.img in the image
+	// path and saves the checkpoint against it, so that sandboxes restored
+	// from this image share those pages rather than each copying them.
+	ExportSharedBase         bool
+	CudaCheckpointPath       string
+	CudaCheckpointSequential bool
 
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
@@ -1696,6 +1714,16 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 	}
 	opt.FilePayload.Files = files
 	opt.HavePagesFile = len(files) > 1
+	if opts.ExportSharedBase {
+		sharedBasePath := filepath.Join(imagePath, checkpointfiles.SharedBaseFileName)
+		f, err := os.OpenFile(sharedBasePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("creating shared base file %q: %w", sharedBasePath, err)
+		}
+		// The shared base file is last in the payload.
+		opt.FilePayload.Files = append(opt.FilePayload.Files, f)
+		opt.HaveSharedBaseFile = true
+	}
 	return nil
 }
 

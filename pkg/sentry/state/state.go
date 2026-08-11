@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -65,6 +66,13 @@ type SaveOpts struct {
 	// file.
 	AppMFExcludeCommittedZeroPages bool
 
+	// SharedBase, if non-nil, is an empty file into which the application
+	// memory file's contents are exported before saving, and which the
+	// checkpoint is then saved against: pages the base carries are recorded
+	// rather than stored, so that every sandbox restored from this checkpoint
+	// maps them from the one shared file instead of copying them.
+	SharedBase *os.File
+
 	// Resume indicates if the statefile is used for save-resume.
 	Resume bool
 
@@ -84,7 +92,7 @@ type SaveOpts struct {
 
 // Close releases resources owned by opts.
 func (opts *SaveOpts) Close() error {
-	var dstErr, pmErr, pfErr error
+	var dstErr, pmErr, pfErr, sbErr error
 	if c, ok := opts.Destination.(io.Closer); ok {
 		dstErr = c.Close()
 	}
@@ -94,7 +102,10 @@ func (opts *SaveOpts) Close() error {
 	if opts.PagesFile != nil {
 		pfErr = opts.PagesFile.Close()
 	}
-	return errors.Join(dstErr, pmErr, pfErr)
+	if opts.SharedBase != nil {
+		sbErr = opts.SharedBase.Close()
+	}
+	return errors.Join(dstErr, pmErr, pfErr, sbErr)
 }
 
 // Save saves the system state.
@@ -157,7 +168,7 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.SharedBase, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 	}

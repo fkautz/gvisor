@@ -45,6 +45,101 @@ import (
 	"gvisor.dev/gvisor/pkg/timing"
 )
 
+// ExportSharedBase writes f's allocated, non-zero pages to dst at the same
+// offsets, so that dst can be used as the shared base of later sandboxes: they
+// map it MAP_PRIVATE over the same range and share its resident pages, and
+// their checkpoints carry only the pages that differ from it. It returns the
+// number of bytes the base covers.
+//
+// Everything else stays a hole in dst, including pages that read as zero. A
+// hole is not a page of zeros: it is a range the base does not carry, which
+// SaveTo will never record a page over as base-carried. Leaving the zeroes out
+// keeps the base sparse without ever claiming to carry a page it does not.
+//
+// Which pages to copy comes from f's own allocation map rather than from the
+// holes in f's file: pages written through a shared mapping may not have been
+// written back, so the file can report a range as a hole while the mapping
+// holds its contents, and a base built from that reports sharing of zero.
+//
+// dst must be an empty regular file on a filesystem that supports sparse
+// files, and must be immutable and readable for as long as any sandbox is
+// restored onto it.
+//
+// Preconditions: f must not itself be backed by a shared base -- exporting one
+// would produce a base with the original's range missing, since f's own file
+// does not carry the pages its base carries.
+func (f *MemoryFile) ExportSharedBase(dst *os.File) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.opts.SharedBaseFile != nil {
+		return 0, fmt.Errorf("cannot export a shared base from a MemoryFile that is already backed by one")
+	}
+	size := uint64(len(f.chunksLoad())) * chunkSize
+	if size == 0 {
+		return 0, nil
+	}
+	if err := dst.Truncate(int64(size)); err != nil {
+		return 0, fmt.Errorf("failed to size the shared base file: %w", err)
+	}
+	dstFD := int(dst.Fd())
+	zeroPage := make([]byte, hostarch.PageSize)
+	// Reading a page that is not committed commits it. SaveTo runs immediately
+	// after this and scans the same memory, decommitting the zero pages it
+	// finds, so the effect does not outlive the checkpoint.
+	var writeErr error
+	writeRun := func(off uint64, bs []byte) bool {
+		for len(bs) != 0 {
+			n, err := unix.Pwrite(dstFD, bs, int64(off))
+			if err != nil {
+				writeErr = fmt.Errorf("failed to write the shared base file at offset %d: %w", off, err)
+				return false
+			}
+			if n == 0 {
+				writeErr = fmt.Errorf("short write to the shared base file at offset %d", off)
+				return false
+			}
+			bs = bs[n:]
+			off += uint64(n)
+		}
+		return true
+	}
+	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
+		f.forEachChunk(maseg.Range(), func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			bs := chunk.sliceAt(chunkFR)
+			// Write maximal runs of non-zero pages, so that a densely
+			// populated base costs one write rather than one per page.
+			runStart := -1
+			for pgoff := 0; pgoff <= len(bs); pgoff += hostarch.PageSize {
+				nonZero := pgoff < len(bs) && !bytes.Equal(bs[pgoff:pgoff+hostarch.PageSize], zeroPage)
+				if nonZero {
+					if runStart < 0 {
+						runStart = pgoff
+					}
+					continue
+				}
+				if runStart >= 0 {
+					if !writeRun(chunkFR.Start+uint64(runStart), bs[runStart:pgoff]) {
+						return false
+					}
+					runStart = -1
+				}
+			}
+			return true
+		})
+		if writeErr != nil {
+			return 0, writeErr
+		}
+	}
+	// Force the writes out before anything asks the filesystem which ranges the
+	// base carries. With delayed allocation the answer for a freshly written
+	// file is "none", and a base that reports carrying nothing silently shares
+	// nothing.
+	if err := dst.Sync(); err != nil {
+		return 0, fmt.Errorf("failed to sync the shared base file: %w", err)
+	}
+	return size, nil
+}
+
 // MarkSavable marks f as savable.
 func (f *MemoryFile) MarkSavable() {
 	f.mu.Lock()
@@ -1078,8 +1173,13 @@ type LoadOpts struct {
 	// overlay installed only at extension time would miss restore entirely,
 	// which is the whole case this exists for.
 	//
-	// This applies to the main MemoryFile only. Private MemoryFiles are saved
-	// without a base and must load normally.
+	// If SharedBaseFile is nil, MemoryFileOpts.SharedBaseFile is used instead,
+	// so a MemoryFile constructed with a base restores onto that base without
+	// the caller having to say so twice.
+	//
+	// Prefer the MemoryFileOpts field: one LoadOpts is shared between the main
+	// MemoryFile and every private MemoryFile that follows it, and only the
+	// main one has a base. Setting it here would offer the base to all of them.
 	SharedBaseFile  *os.File
 	SharedBaseBytes uint64
 }
@@ -1095,6 +1195,17 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}
 	}()
 
+	// Resolve the shared base to restore onto. A MemoryFile constructed with a
+	// base restores onto that base by default; see LoadOpts.SharedBaseFile for
+	// why the option is the exception rather than the rule.
+	baseFile, baseBytes := opts.SharedBaseFile, opts.SharedBaseBytes
+	if baseFile == nil {
+		baseFile, baseBytes = f.opts.SharedBaseFile, f.opts.SharedBaseBytes
+	}
+	if baseFile == nil || baseBytes == 0 {
+		baseFile, baseBytes = nil, 0
+	}
+
 	// Load metadata.
 	timeMetadataStart := gohacks.Nanotime()
 	var mfs memoryFileSaved
@@ -1108,7 +1219,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	// this list exists to prevent. Refuse before any of the checkpoint is
 	// adopted into f, so that a refused restore leaves f as it found it.
 	if len(mfs.baseBacked) != 0 {
-		if opts.SharedBaseFile == nil {
+		if baseFile == nil {
 			return fmt.Errorf(
 				"checkpoint carries %d base-backed range(s) but no shared base file was supplied",
 				len(mfs.baseBacked))
@@ -1124,10 +1235,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 					fr, prevEnd)
 			}
 			prevEnd = fr.End
-			if fr.End > opts.SharedBaseBytes {
+			if fr.End > baseBytes {
 				return fmt.Errorf(
 					"checkpoint base-backed range [%d, %d) is not provided by the supplied base (%d bytes)",
-					fr.Start, fr.End, opts.SharedBaseBytes)
+					fr.Start, fr.End, baseBytes)
 			}
 		}
 	}
@@ -1175,18 +1286,18 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		// that chunks extended after restore keep the same backing, and so a
 		// base range longer than the base file is rejected here rather than
 		// faulting the guest on SIGBUS later.
-		if opts.SharedBaseFile != nil && opts.SharedBaseBytes != 0 {
-			fi, err := opts.SharedBaseFile.Stat()
+		if baseFile != nil {
+			fi, err := baseFile.Stat()
 			if err != nil {
 				return fmt.Errorf("stat shared base file: %w", err)
 			}
-			if size := fi.Size(); size < 0 || opts.SharedBaseBytes > uint64(size) {
+			if size := fi.Size(); size < 0 || baseBytes > uint64(size) {
 				return fmt.Errorf(
 					"shared base range (%d bytes) exceeds the base file (%d bytes)",
-					opts.SharedBaseBytes, size)
+					baseBytes, size)
 			}
-			f.opts.SharedBaseFile = opts.SharedBaseFile
-			f.opts.SharedBaseBytes = opts.SharedBaseBytes
+			f.opts.SharedBaseFile = baseFile
+			f.opts.SharedBaseBytes = baseBytes
 			if err := f.overlaySharedBaseLocked(chunks, 0, uint64(len(chunks))); err != nil {
 				return fmt.Errorf("failed to overlay shared base on restore: %w", err)
 			}

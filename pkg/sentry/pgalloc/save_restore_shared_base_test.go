@@ -547,3 +547,149 @@ func TestLoadFromRejectsBaseCarriedRangePastSuppliedBase(t *testing.T) {
 		t.Errorf("LoadFrom with a short shared base failed with %q, want an error naming the range the base does not provide", err)
 	}
 }
+
+// TestExportSharedBaseProducesACheckpointThatSharesIt closes the loop: a
+// sandbox with no base exports its memory as one, saves against it, and a
+// restore then maps those pages from the exported file instead of copying
+// them. This is the whole mechanism end to end within pgalloc, and it is what
+// a checkpoint taken with runsc's --export-shared-base produces.
+//
+// The restore deliberately passes no base in LoadOpts, so it also covers a
+// MemoryFile constructed with a base restoring onto it by default -- which is
+// how runsc reaches this, since one LoadOpts is shared with every private
+// MemoryFile and only the main one has a base.
+func TestExportSharedBaseProducesACheckpointThatSharesIt(t *testing.T) {
+	pageSize := uint64(hostarch.PageSize)
+	const numPages = 8
+	src := newTestMemoryFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	fr := allocateOverBase(t, src, numPages*pageSize)
+	mem := mapPages(t, src, fr)
+	for i := uint64(0); i < numPages; i++ {
+		copy(mem[i*pageSize:], filledPage(byte(i+0xc0)))
+	}
+
+	base, err := os.CreateTemp("", "pgalloc-exported-base-*")
+	if err != nil {
+		t.Fatalf("failed to create the export target: %v", err)
+	}
+	t.Cleanup(func() { base.Close() })
+	if err := os.Remove(base.Name()); err != nil {
+		t.Fatalf("failed to unlink the export target: %v", err)
+	}
+	baseBytes, err := src.ExportSharedBase(base)
+	if err != nil {
+		t.Fatalf("ExportSharedBase failed: %v", err)
+	}
+	if baseBytes < numPages*pageSize {
+		t.Fatalf("ExportSharedBase reported %d bytes, want at least the %d bytes of allocated memory", baseBytes, numPages*pageSize)
+	}
+	// The export must be sparse: it covers a whole chunk, of which only a few
+	// pages are committed. Materializing the rest would defeat the point.
+	var st unix.Stat_t
+	if err := unix.Fstat(int(base.Fd()), &st); err != nil {
+		t.Fatalf("failed to stat the exported base: %v", err)
+	}
+	if allocated := uint64(st.Blocks) * 512; allocated > 16*numPages*pageSize {
+		t.Errorf("exported base occupies %d bytes on disk for %d bytes of committed memory; it is not sparse", allocated, numPages*pageSize)
+	}
+
+	saved := saveSync(t, src, &SaveOpts{
+		ExcludeCommittedZeroPages: true,
+		SharedBaseFile:            base,
+		SharedBaseBytes:           baseBytes,
+	})
+	if saved.Len() >= int(numPages*pageSize) {
+		t.Errorf("checkpoint is %d bytes for %d bytes of memory the exported base already carries in full", saved.Len(), numPages*pageSize)
+	}
+
+	dst := newTestMemoryFile(t, MemoryFileOpts{
+		DisableMemoryAccounting: true,
+		SharedBaseFile:          base,
+		SharedBaseBytes:         baseBytes,
+	})
+	if err := dst.LoadFrom(context.Background(), bytes.NewReader(saved.Bytes()), &LoadOpts{}); err != nil {
+		t.Fatalf("LoadFrom failed: %v", err)
+	}
+	dstMem := mapPages(t, dst, fr)
+	for i := uint64(0); i < numPages; i++ {
+		checkPage(t, dstMem, i, filledPage(byte(i+0xc0)), "after restore onto the exported base")
+	}
+	if t.Failed() {
+		return
+	}
+	writeSharedBasePage(t, base, 4, 0xf7)
+	checkPage(t, dstMem, 4, filledPage(0xf7), "after rewriting the exported base, a page the restore did not write")
+}
+
+// TestExportSharedBaseRejectsAMemoryFileThatHasOne: exporting from a MemoryFile
+// running on a base would produce a base missing exactly the range the original
+// carries, since those pages live in the base rather than in this MemoryFile's
+// own file. The result would restore as zeros where committed memory belongs.
+func TestExportSharedBaseRejectsAMemoryFileThatHasOne(t *testing.T) {
+	pageSize := uint64(hostarch.PageSize)
+	specs := []basePageSpec{{fill: 0x11}, {fill: 0x22}}
+	base := makeSharedBaseFile(t, specs)
+	f := newTestMemoryFile(t, MemoryFileOpts{
+		DisableMemoryAccounting: true,
+		SharedBaseFile:          base,
+		SharedBaseBytes:         uint64(len(specs)) * pageSize,
+	})
+	allocateOverBase(t, f, uint64(len(specs))*pageSize)
+
+	dst, err := os.CreateTemp("", "pgalloc-exported-base-*")
+	if err != nil {
+		t.Fatalf("failed to create the export target: %v", err)
+	}
+	t.Cleanup(func() { dst.Close() })
+	os.Remove(dst.Name())
+	if _, err := f.ExportSharedBase(dst); err == nil {
+		t.Fatalf("ExportSharedBase from a MemoryFile with a shared base succeeded, want an error")
+	}
+}
+
+// TestExportSharedBaseCopiesContentsAtTheSameOffsets checks the export on its
+// own terms: the base is only useful if a page of it reads back exactly what
+// the MemoryFile has at that same offset.
+func TestExportSharedBaseCopiesContentsAtTheSameOffsets(t *testing.T) {
+	pageSize := uint64(hostarch.PageSize)
+	const numPages = 4
+	src := newTestMemoryFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	fr := allocateOverBase(t, src, numPages*pageSize)
+	mem := mapPages(t, src, fr)
+	for i := uint64(0); i < numPages; i++ {
+		copy(mem[i*pageSize:], filledPage(byte(i+0xe0)))
+	}
+
+	base, err := os.CreateTemp("", "pgalloc-exported-base-*")
+	if err != nil {
+		t.Fatalf("failed to create the export target: %v", err)
+	}
+	t.Cleanup(func() { base.Close() })
+	os.Remove(base.Name())
+	baseBytes, err := src.ExportSharedBase(base)
+	if err != nil {
+		t.Fatalf("ExportSharedBase failed: %v", err)
+	}
+	// SaveTo decides what the base carries by asking the filesystem, so the
+	// export is only usable if the ranges it wrote are visible as data.
+	ranges, err := fileDataRanges(base, baseBytes)
+	if err != nil {
+		t.Fatalf("fileDataRanges on the exported base failed: %v", err)
+	}
+	carried := dataExtents{ranges: ranges}
+	for i := uint64(0); i < numPages; i++ {
+		if !carried.carries(memmap.FileRange{i * pageSize, (i + 1) * pageSize}) {
+			t.Errorf("the exported base does not report carrying page %d; data ranges are %v", i, ranges)
+		}
+	}
+
+	buf := make([]byte, pageSize)
+	for i := uint64(0); i < numPages; i++ {
+		if _, err := base.ReadAt(buf, int64(i*pageSize)); err != nil {
+			t.Fatalf("reading exported base page %d failed: %v", i, err)
+		}
+		if !bytes.Equal(buf, filledPage(byte(i+0xe0))) {
+			t.Errorf("exported base page %d is %s, want %s", i, describePage(buf), describePage(filledPage(byte(i+0xe0))))
+		}
+	}
+}
