@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -920,6 +921,21 @@ type LoadOpts struct {
 	// ownership of this timeline remains in the hands of the caller of
 	// LoadFrom.
 	Timeline *timing.Timeline
+
+	// SharedBaseFile, if non-nil, is a read-only base image in MemoryFile-offset
+	// layout covering [0, SharedBaseBytes). LoadFrom overlays that range of this
+	// MemoryFile MAP_PRIVATE from the base, and adopts it into the MemoryFile's
+	// own options so that later chunk extensions keep the overlay.
+	//
+	// The restore path establishes its own chunk mappings rather than going
+	// through extendChunksLocked, so the base must be applied here as well; an
+	// overlay installed only at extension time would miss restore entirely,
+	// which is the whole case this exists for.
+	//
+	// This applies to the main MemoryFile only. Private MemoryFiles are saved
+	// without a base and must load normally.
+	SharedBaseFile  *os.File
+	SharedBaseBytes uint64
 }
 
 // LoadFrom loads MemoryFile state from the given stream.
@@ -977,6 +993,27 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			chunk := &chunks[i]
 			chunk.mapping = m
 			m += chunkSize
+		}
+		// Adopt the base into this MemoryFile's options before overlaying, so
+		// that chunks extended after restore keep the same backing, and so a
+		// base range longer than the base file is rejected here rather than
+		// faulting the guest on SIGBUS later.
+		if opts.SharedBaseFile != nil && opts.SharedBaseBytes != 0 {
+			fi, err := opts.SharedBaseFile.Stat()
+			if err != nil {
+				return fmt.Errorf("stat shared base file: %w", err)
+			}
+			if size := fi.Size(); size < 0 || opts.SharedBaseBytes > uint64(size) {
+				return fmt.Errorf(
+					"shared base range (%d bytes) exceeds the base file (%d bytes)",
+					opts.SharedBaseBytes, size)
+			}
+			f.opts.SharedBaseFile = opts.SharedBaseFile
+			f.opts.SharedBaseBytes = opts.SharedBaseBytes
+			if err := f.overlaySharedBaseLocked(chunks, 0, uint64(len(chunks))); err != nil {
+				return fmt.Errorf("failed to overlay shared base on restore: %w", err)
+			}
+			mfTimeline.Reached("overlaid shared base")
 		}
 		madviseWG.Add(1)
 		go func() {

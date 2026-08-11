@@ -388,6 +388,28 @@ type MemoryFileOpts struct {
 	// If DisableMemoryAccounting is true, memory usage observed by the
 	// MemoryFile will not be reported in usage.MemoryAccounting.
 	DisableMemoryAccounting bool
+
+	// SharedBaseFile, if non-nil, backs file offsets [0, SharedBaseBytes) with
+	// a MAP_PRIVATE mapping of this file instead of the MemoryFile's own
+	// backing file. Resident base pages are then physically shared by every
+	// MemoryFile mapping the same file, while a write faults to a copy private
+	// to the writing sandbox.
+	//
+	// This is what lets N restored sandboxes share one verified base image
+	// rather than each materializing its own copy of guest memory. The overlay
+	// is established as chunks are extended, so it covers every chunk that
+	// intersects the base range regardless of allocation order.
+	//
+	// SharedBaseFile is expected to be read-only and immutable for the lifetime
+	// of the MemoryFile: it is shared with other sandboxes, so a mutation would
+	// be visible across trust boundaries. MAP_PRIVATE means this MemoryFile
+	// cannot write to it, but it does not stop the file's owner from doing so.
+	SharedBaseFile *os.File
+
+	// SharedBaseBytes is the length of the base range. It must not exceed the
+	// size of SharedBaseFile; NewMemoryFile rejects a longer range rather than
+	// let the guest fault on SIGBUS past end-of-file.
+	SharedBaseBytes uint64
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -434,6 +456,22 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		// ok
 	default:
 		return nil, fmt.Errorf("invalid MemoryFileOpts.DelayedEviction: %v", opts.DelayedEviction)
+	}
+
+	// A base range longer than the base file would map past end-of-file, and
+	// the guest would take SIGBUS on the first touch of the gap rather than
+	// anything diagnosable. Reject it here, while the caller still has a file
+	// to blame.
+	if opts.SharedBaseFile != nil && opts.SharedBaseBytes != 0 {
+		fi, err := opts.SharedBaseFile.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stat MemoryFileOpts.SharedBaseFile: %w", err)
+		}
+		if size := fi.Size(); size < 0 || opts.SharedBaseBytes > uint64(size) {
+			return nil, fmt.Errorf(
+				"MemoryFileOpts.SharedBaseBytes (%d) exceeds the size of SharedBaseFile (%d)",
+				opts.SharedBaseBytes, size)
+		}
 	}
 
 	// Truncate the file to 0 bytes first to ensure that it's empty.
@@ -955,6 +993,9 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 			m += chunkSize
 		}
 	}
+	if err := f.overlaySharedBaseLocked(newChunks, oldNrChunks, newNrChunks); err != nil {
+		return err
+	}
 	f.chunks.Store(&newChunks)
 
 	// Mark void pages free.
@@ -963,6 +1004,63 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 		End:   newNrChunks * chunkSize,
 	})
 
+	return nil
+}
+
+// overlaySharedBaseLocked re-maps the part of each newly extended chunk that
+// falls inside [0, SharedBaseBytes) as a MAP_PRIVATE mapping of
+// opts.SharedBaseFile, replacing the MAP_SHARED mapping of f.file that
+// extendChunksLocked just established for those addresses.
+//
+// The result is that reads of the base range are served from the shared file's
+// page cache pages -- physically shared with every other MemoryFile mapping the
+// same file -- while the first write to a page faults a private copy that no
+// other sandbox can observe. That is the whole shared-copy-on-write-base
+// mechanism; nothing above pgalloc has to know the base exists, because
+// MapInternal (and therefore platform AddressSpace.MapFile) keeps returning
+// this same chunk mapping.
+//
+// Note that decommit of a base-range page cannot punch a hole in f.file for
+// these addresses, since f.file no longer backs them. Restore does not decommit
+// the base range, so this is not exercised; a future caller that frees base
+// pages would need to fall back to re-mapping rather than hole punching.
+//
+// Preconditions: f.mu must be locked. newChunks[oldNrChunks:newNrChunks] have
+// had their mappings assigned.
+func (f *MemoryFile) overlaySharedBaseLocked(newChunks []chunkInfo, oldNrChunks, newNrChunks uint64) error {
+	if f.opts.SharedBaseFile == nil || f.opts.SharedBaseBytes == 0 {
+		return nil
+	}
+	for i := oldNrChunks; i < newNrChunks; i++ {
+		// In tests f.file may be nil, leaving chunks unmapped; there is then no
+		// mapping to overlay.
+		if newChunks[i].mapping == 0 {
+			continue
+		}
+		// Chunk i covers file offsets [i*chunkSize, (i+1)*chunkSize). Overlay
+		// only the part of it below SharedBaseBytes. Because the base range
+		// starts at offset 0 and chunks are contiguous, that part always begins
+		// at the start of the chunk, so the mapping address needs no adjustment.
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > f.opts.SharedBaseBytes {
+			end = f.opts.SharedBaseBytes
+		}
+		if start >= end {
+			// This chunk lies entirely past the base range.
+			continue
+		}
+		if _, _, errno := unix.Syscall6(
+			unix.SYS_MMAP,
+			newChunks[i].mapping,
+			uintptr(end-start),
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_PRIVATE|unix.MAP_FIXED,
+			f.opts.SharedBaseFile.Fd(),
+			uintptr(start)); errno != 0 {
+			return fmt.Errorf("overlay shared base over chunk at offset %d: %w", start, errno)
+		}
+	}
 	return nil
 }
 
